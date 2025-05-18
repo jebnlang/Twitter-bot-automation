@@ -207,7 +207,8 @@ async function getUniqueTopicAndFreshContext(
   previousPosts: Pick<PostLogEntry, 'posted_text' | 'topic'>[]
 ): Promise<TopicContextResult> {
   console.log('Post Writer Agent: Attempting to find a unique topic and fresh context...');
-  const recentTopicsToAvoid = previousPosts.map(p => p.topic).slice(-7).filter(t => t !== undefined) as string[];
+  // Filter both null and undefined values
+  const recentTopicsToAvoid = previousPosts.map(p => p.topic).slice(-7).filter(t => t !== undefined && t !== null) as string[];
   console.log('Post Writer Agent: Recent topics to avoid:', recentTopicsToAvoid);
 
   let attempts = 0;
@@ -254,7 +255,8 @@ async function getUniqueTopicAndFreshContext(
     }
 
     for (const candidateTopic of candidateTopics) {
-      if (!recentTopicsToAvoid.some(avoid => avoid.toLowerCase() === candidateTopic.toLowerCase())) {
+      // Add null safety with optional chaining and provide a fallback empty string
+      if (!recentTopicsToAvoid.some(avoid => avoid?.toLowerCase() === candidateTopic.toLowerCase())) {
         console.log(`Post Writer Agent: Found unique candidate topic from broad search: "${candidateTopic}"`);
         
         console.log(`Post Writer Agent: Performing focused Tavily search on topic: "${candidateTopic}"`);
