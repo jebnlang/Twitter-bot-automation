@@ -156,7 +156,7 @@ async function main() {
       raw_openai_response: preparedData.rawOpenAIResponse || undefined,
       persona_alignment_check: preparedData.personaAlignmentCheck || undefined,
       scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
-      // created_at will be set by Supabase default
+      search_topic: preparedData.searchTopic || undefined,
     };
 
     if (preparedData.success && preparedData.postText) {

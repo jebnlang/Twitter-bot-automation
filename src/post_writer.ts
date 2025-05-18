@@ -138,6 +138,7 @@ interface PreparedPostData {
   success: boolean;
   postText: string | null;
   topic: string | null;
+  searchTopic: string | null;
   rawOpenAIResponse: object | null;
   personaAlignmentCheck: string | null;
   errorMessage?: string;
@@ -150,6 +151,7 @@ interface PostLogEntry {
   posted_text: string; // Renamed from postedText for Supabase column convention
   post_url?: string;    // Renamed from postUrl
   topic?: string;
+  search_topic?: string; // Add this to store which predefined topic was used for the search
   status: 'pending' | 'posted' | 'failed' | 'generation_failed' | 'ready_to_post'; // Added status & new 'ready_to_post'
   error_message?: string; // Added error message
   raw_openai_response?: object; // For JSONB
@@ -198,11 +200,6 @@ async function appendPostToLog(newPostData: Partial<PostLogEntry>): Promise<void
 }
 
 // --- Function to get a unique topic and fresh context ---
-interface TopicContextResult {
-  topic: string | null;
-  searchContext: string | null;
-}
-
 async function getUniqueTopicAndFreshContext(
   previousPosts: Pick<PostLogEntry, 'posted_text' | 'topic'>[]
 ): Promise<TopicContextResult> {
@@ -212,33 +209,87 @@ async function getUniqueTopicAndFreshContext(
   console.log('Post Writer Agent: Recent topics to avoid:', recentTopicsToAvoid);
 
   let attempts = 0;
-  const maxAttempts = 3;
+  const maxAttempts = 5; // Increased from 3 to 5 for more flexibility with predetermined topics
 
   while (attempts < maxAttempts) {
     attempts++;
     console.log(`Post Writer Agent: Topic finding attempt ${attempts}/${maxAttempts}`);
     
-    let broadSearchQuery = 'latest news and trends in AI prompt engineering';
-    if (attempts === 2) broadSearchQuery = 'hot topics in large language models and prompting techniques';
-    if (attempts === 3) broadSearchQuery = 'breakthroughs in AI interaction and prompt crafting';
+    // Instead of hardcoded search queries, get a random topic from the search_topics table
+    let searchTopic: string;
+    try {
+      // Fetch topics from search_topics table in random order
+      // Exclude topics that have been recently used
+      let { data: availableTopics, error } = await supabase
+        .from('search_topics')
+        .select('id, topic')
+        .order('last_used_at', { ascending: true, nullsFirst: true }) // Prefer topics that haven't been used yet or used long ago
+        .limit(10); // Get 10 topics to choose from
+      
+      if (error) {
+        console.error('Post Writer Agent: Error fetching search topics from Supabase:', error);
+        // Fallback to hardcoded topics if there's an error
+        const fallbackTopics = [
+          'latest news and trends in AI prompt engineering',
+          'hot topics in large language models and prompting techniques',
+          'breakthroughs in AI interaction and prompt crafting',
+          'AI coding assistants and developer tools',
+          'no-code platforms for AI application development'
+        ];
+        searchTopic = fallbackTopics[Math.floor(Math.random() * fallbackTopics.length)];
+        console.log(`Post Writer Agent: Using fallback search topic: "${searchTopic}"`);
+      } else if (!availableTopics || availableTopics.length === 0) {
+        console.error('Post Writer Agent: No search topics found in database, using fallback');
+        searchTopic = 'latest news and trends in AI prompt engineering';
+      } else {
+        // Filter out recently used topics
+        const filteredTopics = availableTopics.filter(t => 
+          !recentTopicsToAvoid.some(avoid => 
+            avoid?.toLowerCase().includes(t.topic.toLowerCase()) || 
+            t.topic.toLowerCase().includes(avoid?.toLowerCase())
+          )
+        );
+        
+        if (filteredTopics.length === 0) {
+          // If all topics have been recently used, just pick a random one from the original list
+          console.log('Post Writer Agent: All topics have been recently used, selecting random topic anyway');
+          const randomTopic = availableTopics[Math.floor(Math.random() * availableTopics.length)];
+          searchTopic = randomTopic.topic;
+        } else {
+          // Pick a random topic from the filtered list
+          const randomTopic = filteredTopics[Math.floor(Math.random() * filteredTopics.length)];
+          searchTopic = randomTopic.topic;
+          
+          // Update the last_used_at timestamp for this topic
+          await supabase
+            .from('search_topics')
+            .update({ last_used_at: new Date().toISOString() })
+            .eq('id', randomTopic.id);
+        }
+        console.log(`Post Writer Agent: Selected search topic: "${searchTopic}"`);
+      }
+    } catch (topicError) {
+      console.error('Post Writer Agent: Error selecting search topic:', topicError);
+      searchTopic = 'latest news and trends in AI prompt engineering'; // Fallback
+    }
     
     let broadSearchResults;
     try {
-      console.log(`Post Writer Agent: Performing broad Tavily search: "${broadSearchQuery}"`);
-      const tavilyResponse = await tavilyApi.search(broadSearchQuery, {
+      console.log(`Post Writer Agent: Performing Tavily search using topic: "${searchTopic}"`);
+      const tavilyResponse = await tavilyApi.search(searchTopic, {
         search_depth: "basic",
         max_results: 7,
       });
       broadSearchResults = tavilyResponse.results; 
 
       if (!broadSearchResults || broadSearchResults.length === 0) {
-        console.warn('Post Writer Agent: Tavily broad search returned no results.');
+        console.warn('Post Writer Agent: Tavily search returned no results.');
         if (attempts === maxAttempts) return { topic: null, searchContext: null };
         await new Promise(resolve => setTimeout(resolve, 1500)); 
         continue;
       }
     } catch (searchError) {
-      console.error('Post Writer Agent: Error during Tavily broad search:', searchError);
+      console.error('Post Writer Agent: Error during Tavily search:', searchError);
       if (attempts === maxAttempts) return { topic: null, searchContext: null };
       await new Promise(resolve => setTimeout(resolve, 1500));
       continue;
@@ -249,15 +300,15 @@ async function getUniqueTopicAndFreshContext(
       .filter((title: string | null): title is string => title !== null && title.trim() !== '');
 
     if (candidateTopics.length === 0) {
-      console.warn('Post Writer Agent: Could not extract any candidate topics from Tavily broad search results.');
+      console.warn('Post Writer Agent: Could not extract any candidate topics from Tavily search results.');
       if (attempts === maxAttempts) return { topic: null, searchContext: null };
       continue; 
     }
 
     for (const candidateTopic of candidateTopics) {
-      // Add null safety with optional chaining and provide a fallback empty string
+      // Add null safety with optional chaining
       if (!recentTopicsToAvoid.some(avoid => avoid?.toLowerCase() === candidateTopic.toLowerCase())) {
-        console.log(`Post Writer Agent: Found unique candidate topic from broad search: "${candidateTopic}"`);
+        console.log(`Post Writer Agent: Found unique candidate topic from search: "${candidateTopic}"`);
         
         console.log(`Post Writer Agent: Performing focused Tavily search on topic: "${candidateTopic}"`);
         try {
@@ -280,7 +331,14 @@ async function getUniqueTopicAndFreshContext(
             .join('\n\n---\n');
           
           console.log(`Post Writer Agent: Successfully gathered focused context for "${candidateTopic}" from Tavily.`);
-          return { topic: candidateTopic, searchContext: formattedFocusedSearchContext };
+          
+          // Important: Return both the refined candidate topic AND the original search topic
+          // This ensures we know which predefined topic from our table generated this content
+          return { 
+            topic: candidateTopic, 
+            searchContext: formattedFocusedSearchContext,
+            originalSearchTopic: searchTopic // Add this as part of the return type
+          };
 
         } catch (focusedSearchError) {
           console.error(`Post Writer Agent: Error during Tavily focused search for topic "${candidateTopic}":`, focusedSearchError);
@@ -288,11 +346,18 @@ async function getUniqueTopicAndFreshContext(
         }
       }
     }
-    console.warn('Post Writer Agent: All candidate topics from this broad search were similar to recent posts or focused search failed. Retrying broad search if attempts left.');
+    console.warn('Post Writer Agent: All candidate topics from this search were similar to recent posts or focused search failed. Retrying with different search topic if attempts left.');
   }
 
   console.warn('Post Writer Agent: Could not find a unique topic and gather focused context after max attempts with Tavily.');
   return { topic: null, searchContext: null };
+}
+
+// --- Update the TopicContextResult interface to include the original search topic ---
+interface TopicContextResult {
+  topic: string | null;
+  searchContext: string | null;
+  originalSearchTopic?: string; // Add this to store which topic from our table was used
 }
 
 // --- OpenAI Content Generation ---
@@ -610,7 +675,8 @@ async function preparePostData(): Promise<PreparedPostData> {
   const previousPostsFromDb = await loadPreviousPosts();
   const previousPostContext = previousPostsFromDb.map(p => ({ posted_text: p.posted_text, topic: p.topic }));
 
-  const { topic: currentTopic, searchContext } = await getUniqueTopicAndFreshContext(previousPostContext);
+  const topicResult = await getUniqueTopicAndFreshContext(previousPostContext);
+  const { topic: currentTopic, searchContext, originalSearchTopic } = topicResult;
 
   if (!currentTopic || !searchContext) {
     console.error('Post Writer Agent: Could not determine a unique topic or fetch search context during data preparation.');
@@ -618,6 +684,7 @@ async function preparePostData(): Promise<PreparedPostData> {
       success: false,
       postText: null,
       topic: null,
+      searchTopic: null,
       rawOpenAIResponse: null,
       personaAlignmentCheck: null,
       errorMessage: 'Could not determine a unique topic or fetch search context.'
@@ -642,10 +709,12 @@ async function preparePostData(): Promise<PreparedPostData> {
 
     if (newPostText) {
       console.log(`Post Writer Agent: Successfully generated post content for topic "${finalGeneratedTopicForLog}"`);
+      console.log(`Post Writer Agent: Original search topic: "${originalSearchTopic}"`);
       return {
         success: true,
         postText: newPostText,
         topic: finalGeneratedTopicForLog,
+        searchTopic: originalSearchTopic || null,
         rawOpenAIResponse: rawOpenAIResponseForLog,
         personaAlignmentCheck: personaAlignmentCheckForLog,
       };
@@ -661,8 +730,9 @@ async function preparePostData(): Promise<PreparedPostData> {
   return {
     success: false,
     postText: null,
-    topic: finalGeneratedTopicForLog || currentTopic, // Still provide topic if known
-    rawOpenAIResponse: rawOpenAIResponseForLog, // Log what we got from the last attempt
+    topic: finalGeneratedTopicForLog || currentTopic,
+    searchTopic: originalSearchTopic || null,
+    rawOpenAIResponse: rawOpenAIResponseForLog,
     personaAlignmentCheck: personaAlignmentCheckForLog,
     errorMessage: 'Failed to generate post content after multiple attempts.'
   };
