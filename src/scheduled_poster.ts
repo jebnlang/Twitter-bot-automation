@@ -14,11 +14,15 @@ dotenvConfig();
 // --- Constants ---
 const HOURS_BETWEEN_POSTS = 6;
 const MAX_TIME_VARIATION_MS = 30 * 60 * 1000; // 30 minutes in milliseconds
-const MIN_TIME_BEFORE_FIRST_POST_MS = 5 * 60 * 1000; // 5 minutes for the very first post or after a long gap
+const MIN_TIME_BEFORE_FIRST_POST_MS = 0; // Was 5 * 60 * 1000 (5 minutes), now immediate
 
 // --- Supabase Client ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// --- Deploy Mode Detection ---
+// Check if this is the first run after deployment by setting env var
+const IS_FIRST_RUN = process.env.IS_FIRST_RUN === 'true';
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('Scheduled Poster: Error - SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not defined.');
@@ -99,6 +103,8 @@ async function main() {
       console.log('--- Scheduled Poster: Run Completed (Waiting for scheduled post) ---');
       return; // Exit early
     }
+  } else {
+    console.log('Scheduled Poster: No ready posts found. Will prepare a new one.');
   }
 
   // 2. If no post was found ready, or if a post was just published, prepare the next one.
@@ -138,16 +144,30 @@ async function main() {
     }
 
     let nextScheduledTimeUTC: Date;
+    let postImmediately = false;
+    
     if (lastPostTimestampForScheduling) {
+        // Normal scheduling based on last post time
         nextScheduledTimeUTC = new Date(lastPostTimestampForScheduling.getTime() + (HOURS_BETWEEN_POSTS * 60 * 60 * 1000) + getRandomVariationMs());
     } else {
-        // No posts ever, or last one very old. Schedule it soon.
-        nextScheduledTimeUTC = new Date(Date.now() + MIN_TIME_BEFORE_FIRST_POST_MS + getRandomVariationMs());
+        // This is a first post situation (no previous posts found)
+        
+        // Check if we should post immediately after deployment
+        // This happens if we have no posts yet and MIN_TIME_BEFORE_FIRST_POST_MS is 0
+        if (MIN_TIME_BEFORE_FIRST_POST_MS === 0) {
+            console.log('Scheduled Poster: First post after deployment - scheduling for immediate posting');
+            nextScheduledTimeUTC = new Date(); // Schedule for now
+            postImmediately = true;
+        } else {
+            // Use the small delay as configured
+            nextScheduledTimeUTC = new Date(Date.now() + MIN_TIME_BEFORE_FIRST_POST_MS + getRandomVariationMs());
+        }
     }
+    
     // Ensure next post is not scheduled in the past if calculations are off or server time is weird
-    if (nextScheduledTimeUTC.getTime() < Date.now()) {
+    if (!postImmediately && nextScheduledTimeUTC.getTime() < Date.now()) {
         console.warn('Scheduled Poster: Calculated next schedule time is in the past. Adjusting to be in the near future.');
-        nextScheduledTimeUTC = new Date(Date.now() + MIN_TIME_BEFORE_FIRST_POST_MS + Math.abs(getRandomVariationMs()));
+        nextScheduledTimeUTC = new Date(Date.now() + Math.abs(getRandomVariationMs())); // Small random delay
     }
 
     const newPostEntry: Partial<PostLogEntry> = {
@@ -160,9 +180,62 @@ async function main() {
     };
 
     if (preparedData.success && preparedData.postText) {
-      newPostEntry.status = 'ready_to_post' as const;
-      await appendPostToLog(newPostEntry);
-      console.log(`Scheduled Poster: Successfully prepared and scheduled next post. Topic: "${preparedData.topic}", Scheduled for: ${nextScheduledTimeUTC.toISOString()}`);
+      // First determine if we should immediately publish this post
+      if (postImmediately) {
+        console.log(`Scheduled Poster: Post deployment immediate publishing mode activated`);
+        
+        // First save with "ready_to_post" status, but we'll immediately publish it
+        newPostEntry.status = 'ready_to_post' as const;
+        const { data: savedPost, error: saveError } = await supabase
+          .from('posts')
+          .insert([newPostEntry])
+          .select()
+          .single();
+          
+        if (saveError) {
+          console.error('Scheduled Poster: Error saving new post:', saveError);
+          return;
+        }
+        
+        console.log(`Scheduled Poster: New post saved with ID ${savedPost.id}, now publishing immediately`);
+        
+        // Immediately publish it
+        const postUrl = await publishTwitterPost(savedPost.posted_text);
+        const currentTimeUTC = new Date().toISOString();
+        
+        if (postUrl) {
+          await supabase
+            .from('posts')
+            .update({
+              status: 'posted' as const,
+              post_url: postUrl,
+              posted_at_utc: currentTimeUTC,
+              error_message: null 
+            })
+            .eq('id', savedPost.id);
+          console.log(`Scheduled Poster: Successfully published post ID ${savedPost.id} immediately after preparation. URL: ${postUrl}`);
+          
+          // Now prepare the next post that will be scheduled normally
+          console.log(`Scheduled Poster: Starting preparation of the next post after immediate publishing...`);
+          main(); // Recursive call to generate the next scheduled post
+          return;
+        } else {
+          await supabase
+            .from('posts')
+            .update({
+              status: 'failed_to_post' as const,
+              error_message: 'Immediate publishing failed or URL not retrieved.',
+              posted_at_utc: currentTimeUTC,
+            })
+            .eq('id', savedPost.id);
+          console.error(`Scheduled Poster: Failed to publish post ID ${savedPost.id} immediately.`);
+        }
+      } else {
+        // Normal scheduling
+        newPostEntry.status = 'ready_to_post' as const;
+        await appendPostToLog(newPostEntry);
+        console.log(`Scheduled Poster: Successfully prepared and scheduled next post. Topic: "${preparedData.topic}", Scheduled for: ${nextScheduledTimeUTC.toISOString()}`);
+      }
     } else {
       newPostEntry.status = 'generation_failed' as const;
       newPostEntry.error_message = preparedData.errorMessage || 'Unknown error during content generation.';
