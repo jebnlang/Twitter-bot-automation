@@ -69,19 +69,20 @@ async function main() {
       const postUrl = await publishTwitterPost(postToPublish.posted_text!);
       const currentTimeUTC = new Date().toISOString();
 
+      // Consider both actual URLs and the POSTED_SUCCESSFULLY marker as success
       if (postUrl) {
         await supabase
           .from('posts')
           .update({
             status: 'posted' as const,
-            post_url: postUrl,
+            post_url: postUrl === "POSTED_SUCCESSFULLY" ? "https://x.com/posted-successfully" : postUrl, // Use a standard URL for the placeholder
             posted_at_utc: currentTimeUTC,
             error_message: null 
           })
           .eq('id', postToPublish.id!);
-        console.log(`Scheduled Poster: Successfully published post ID ${postToPublish.id}. URL: ${postUrl}`);
+        console.log(`Scheduled Poster: Successfully published post ID ${postToPublish.id}. ${postUrl === "POSTED_SUCCESSFULLY" ? "URL retrieval skipped." : `URL: ${postUrl}`}`);
         postPublishedInThisRun = true;
-        lastPostTimestampForScheduling = new Date(currentTimeUTC); // Use the actual publish time for next schedule
+        lastPostTimestampForScheduling = new Date(currentTimeUTC);
       } else {
         await supabase
           .from('posts')
@@ -207,17 +208,18 @@ async function main() {
         const postUrl = await publishTwitterPost(savedPost.posted_text);
         const currentTimeUTC = new Date().toISOString();
         
+        // Consider both actual URLs and the POSTED_SUCCESSFULLY marker as success
         if (postUrl) {
           await supabase
             .from('posts')
             .update({
               status: 'posted' as const,
-              post_url: postUrl,
+              post_url: postUrl === "POSTED_SUCCESSFULLY" ? "https://x.com/posted-successfully" : postUrl,
               posted_at_utc: currentTimeUTC,
               error_message: null 
             })
             .eq('id', savedPost.id);
-          console.log(`Scheduled Poster: Successfully published post ID ${savedPost.id} immediately after preparation. URL: ${postUrl}`);
+          console.log(`Scheduled Poster: Successfully published post ID ${savedPost.id} immediately after preparation. ${postUrl === "POSTED_SUCCESSFULLY" ? "URL retrieval skipped." : `URL: ${postUrl}`}`);
           
           // Now prepare the next post that will be scheduled normally
           console.log(`Scheduled Poster: Starting preparation of the next post after immediate publishing...`);

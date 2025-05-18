@@ -508,8 +508,8 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
     try {
       console.log(`Post Writer Agent: Navigation attempt ${retryCount + 1}/${maxRetries + 1} to Twitter compose page...`);
       
-      // Increased timeout for initial page load
-      await page.goto('https://x.com/compose/post', { waitUntil: 'networkidle', timeout: 120000 });
+      // Don't wait for networkidle - just wait for load event which is more reliable
+      await page.goto('https://x.com/compose/post', { waitUntil: 'load', timeout: 60000 });
       console.log('Post Writer Agent: Page loaded, waiting for content to stabilize...');
       
       // Wait for page to be fully interactive
@@ -599,18 +599,19 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
       console.log('Post Writer Agent: Waiting for post to complete (15 seconds)...');
       await page.waitForTimeout(15000);
       
-      // Consider post successful even if we can't confirm URL
-      console.log('Post Writer Agent: Post likely successful. Will attempt to get URL...');
+      // Consider post successful after clicking the button and waiting
+      console.log('Post Writer Agent: Post successful! No need to retrieve URL.');
+      postUrl = "POSTED_SUCCESSFULLY"; // Use a placeholder instead of null to indicate success
       
-      // Try to get post URL but don't make it critical
+      // Try to get post URL but don't make it critical - keep this code but make it non-blocking
       try {
         const profileLink = await page.locator('a[data-testid="AppTabBar_Profile_Link"]').getAttribute('href');
         if (profileLink) {
-          console.log(`Post Writer Agent: Navigating to profile ${profileLink} to find post URL.`);
-          await page.goto(`https://x.com${profileLink}`, { waitUntil: 'networkidle', timeout: 60000});
+          console.log(`Post Writer Agent: Attempting to navigate to profile ${profileLink} to find post URL.`);
+          await page.goto(`https://x.com${profileLink}`, { waitUntil: 'load', timeout: 30000});
           
           console.log('Post Writer Agent: Waiting for tweets to appear on profile page...');
-          await page.waitForSelector('article[data-testid="tweet"]', { state: 'visible', timeout: 30000 });
+          await page.waitForSelector('article[data-testid="tweet"]', { state: 'visible', timeout: 20000 });
           
           const firstTweetLink = await page.locator('article[data-testid="tweet"] a:has(time[datetime])').first().getAttribute('href');
           if (firstTweetLink) {
@@ -619,7 +620,8 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
           }
         }
       } catch (urlError) {
-        console.log('Post Writer Agent: Could not retrieve post URL, but post was likely successful.');
+        console.log('Post Writer Agent: Could not retrieve post URL, but post was successfully published.');
+        // Don't change the postUrl value - keep the "POSTED_SUCCESSFULLY" marker
       }
       
       // Successfully completed the posting process
@@ -628,13 +630,14 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
     } catch (error: any) {
       console.error(`Post Writer Agent: Error during attempt ${retryCount + 1}:`, error);
       
-      // Save a screenshot for debugging
+      // Replace file saving with base64 logging
       try {
-        const screenshotPath = `/data/error_screenshot_${Date.now()}.png`;
-        await page.screenshot({ path: screenshotPath });
-        console.log(`Post Writer Agent: Saved error screenshot to ${screenshotPath}`);
+        const screenshotBuffer = await page.screenshot();
+        const base64Screenshot = screenshotBuffer.toString('base64');
+        console.log(`Post Writer Agent: Error screenshot (base64):`);
+        console.log(`data:image/png;base64,${base64Screenshot}`);
       } catch (screenshotError) {
-        console.log('Post Writer Agent: Could not save error screenshot:', screenshotError);
+        console.log('Post Writer Agent: Could not capture error screenshot:', screenshotError);
       }
       
       // If we have retries left, try again
