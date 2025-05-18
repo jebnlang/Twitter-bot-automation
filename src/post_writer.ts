@@ -133,16 +133,30 @@ async function loadPostWriterPersona(): Promise<void> {
   }
 }
 
+// --- New Interface for Prepared Post Data ---
+interface PreparedPostData {
+  success: boolean;
+  postText: string | null;
+  topic: string | null;
+  rawOpenAIResponse: object | null;
+  personaAlignmentCheck: string | null;
+  errorMessage?: string;
+}
+
 // --- Supabase Log Handling ---
 interface PostLogEntry {
+  id?: number; // Or string if UUID, assuming number for auto-incrementing bigint
   timestamp: string; // Will be handled by Supabase default NOW()
   posted_text: string; // Renamed from postedText for Supabase column convention
   post_url?: string;    // Renamed from postUrl
   topic?: string;
-  status: 'pending' | 'posted' | 'failed' | 'generation_failed'; // Added status
+  status: 'pending' | 'posted' | 'failed' | 'generation_failed' | 'ready_to_post'; // Added status & new 'ready_to_post'
   error_message?: string; // Added error message
   raw_openai_response?: object; // For JSONB
   persona_alignment_check?: string;
+  scheduled_time_utc?: string; // For TIMESTAMPTZ
+  posted_at_utc?: string; // For TIMESTAMPTZ
+  generation_log?: object; // For JSONB
 }
 
 async function loadPreviousPosts(): Promise<Pick<PostLogEntry, 'posted_text' | 'topic'>[]> {
@@ -150,7 +164,7 @@ async function loadPreviousPosts(): Promise<Pick<PostLogEntry, 'posted_text' | '
     const { data, error } = await supabase
       .from('posts')
       .select('posted_text, topic')
-      .order('timestamp', { ascending: false })
+      .order('posted_at_utc', { ascending: false }) // IMPORTANT: Order by actual post time
       .limit(10); // Load last 10 posts for context
 
     if (error) {
@@ -166,20 +180,12 @@ async function loadPreviousPosts(): Promise<Pick<PostLogEntry, 'posted_text' | '
 }
 
 // Updated to log more details to Supabase
-async function appendPostToLog(newPostData: Omit<PostLogEntry, 'timestamp'>): Promise<void> {
+async function appendPostToLog(newPostData: Partial<PostLogEntry>): Promise<void> { // Use Partial as not all fields always present
   try {
-    const { error } = await supabase.from('posts').insert([
-      {
-        posted_text: newPostData.posted_text,
-        post_url: newPostData.post_url,
-        topic: newPostData.topic,
-        status: newPostData.status,
-        error_message: newPostData.error_message,
-        raw_openai_response: newPostData.raw_openai_response,
-        persona_alignment_check: newPostData.persona_alignment_check,
-        // timestamp is handled by Supabase default
-      }
-    ]);
+    // Ensure all fields map to new Supabase columns if needed
+    // created_at is handled by Supabase default NOW()
+    // scheduled_time_utc and posted_at_utc will be set explicitly by the scheduler when appropriate
+    const { error } = await supabase.from('posts').insert([newPostData]);
 
     if (error) {
       console.error('Post Writer Agent: Error appending post to Supabase log:', error);
@@ -590,44 +596,40 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
     console.error('Post Writer Agent: Error closing browser:', closeError);
   }
   
-  return postUrl; // This will be null if URL couldn't be confirmed
+  return postUrl; // This will be null if URL couldn't be confirmed or posting failed
 }
 
-
-// --- Main Execution ---
-async function mainPostWriter() {
-  console.log('--- Post Writer Agent Starting ---');
+// --- NEW Main Data Preparation Function ---
+async function preparePostData(): Promise<PreparedPostData> {
+  console.log('--- Post Writer Agent: Starting Data Preparation ---');
 
   await loadPostWriterPersona();
 
   const previousPostsFromDb = await loadPreviousPosts();
-  // Pass only text and topic for unique topic generation context
   const previousPostContext = previousPostsFromDb.map(p => ({ posted_text: p.posted_text, topic: p.topic }));
-
 
   const { topic: currentTopic, searchContext } = await getUniqueTopicAndFreshContext(previousPostContext);
 
   if (!currentTopic || !searchContext) {
-    console.error('Post Writer Agent: Could not determine a unique topic or fetch search context. Exiting.');
-    // Log failure to Supabase
-    await appendPostToLog({
-      posted_text: 'TOPIC_GENERATION_FAILED',
-      status: 'failed',
-      topic: 'Unknown',
-      error_message: 'Could not determine a unique topic or fetch search context.'
-    });
-    return;
+    console.error('Post Writer Agent: Could not determine a unique topic or fetch search context during data preparation.');
+    return {
+      success: false,
+      postText: null,
+      topic: null,
+      rawOpenAIResponse: null,
+      personaAlignmentCheck: null,
+      errorMessage: 'Could not determine a unique topic or fetch search context.'
+    };
   }
 
   let newPostText: string | null = null;
   let finalGeneratedTopicForLog: string | null = null;
   let rawOpenAIResponseForLog: object | null = null;
   let personaAlignmentCheckForLog: string | null = null;
-  const maxRetries = 3;
+  const maxRetries = 3; // Retries for OpenAI generation
 
   for (let i = 0; i < maxRetries; i++) {
-    console.log(`Post Writer Agent: Attempt ${i + 1} to generate a new post on topic: "${currentTopic}".`);
-    // Ensure previousPostTexts is an array of strings for generateNewPost
+    console.log(`Post Writer Agent: Attempt ${i + 1} to generate new post data on topic: "${currentTopic}".`);
     const previousPostTextsOnly = previousPostContext.map(p => p.posted_text || '');
     const generationResult = await generateNewPost(postWriterPersonaContent, previousPostTextsOnly, currentTopic, searchContext);
     
@@ -637,51 +639,37 @@ async function mainPostWriter() {
     personaAlignmentCheckForLog = generationResult.personaAlignmentCheckForLog;
 
     if (newPostText) {
-      console.log(`Post Writer Agent: Successfully generated post content: "${newPostText}" with topic "${finalGeneratedTopicForLog}"`);
-      break;
+      console.log(`Post Writer Agent: Successfully generated post content for topic "${finalGeneratedTopicForLog}"`);
+      return {
+        success: true,
+        postText: newPostText,
+        topic: finalGeneratedTopicForLog,
+        rawOpenAIResponse: rawOpenAIResponseForLog,
+        personaAlignmentCheck: personaAlignmentCheckForLog,
+      };
     }
     if (i < maxRetries - 1) {
-      console.log('Post Writer Agent: Failed to generate suitable post, retrying after a short delay...');
+      console.log('Post Writer Agent: Failed to generate suitable post data, retrying after a short delay...');
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
 
-  if (!newPostText) {
-    console.error(`Post Writer Agent: Failed to generate new post content for topic "${finalGeneratedTopicForLog || currentTopic}" after multiple attempts. Exiting.`);
-    await appendPostToLog({
-      posted_text: 'GENERATION_FAILED',
-      topic: finalGeneratedTopicForLog || currentTopic,
-      status: 'generation_failed',
-      error_message: 'Failed to generate post content after multiple attempts.',
-      raw_openai_response: rawOpenAIResponseForLog === null ? undefined : rawOpenAIResponseForLog,
-      persona_alignment_check: personaAlignmentCheckForLog === null ? undefined : personaAlignmentCheckForLog
-    });
-    return;
-  }
-
-  const postedTweetUrl = await publishTwitterPost(newPostText);
-
-  await appendPostToLog({
-    posted_text: newPostText,
-    post_url: postedTweetUrl || undefined,
-    topic: finalGeneratedTopicForLog || undefined,
-    status: postedTweetUrl ? 'posted' : 'failed',
-    error_message: postedTweetUrl ? undefined : 'Failed to publish tweet or retrieve URL.',
-    raw_openai_response: rawOpenAIResponseForLog === null ? undefined : rawOpenAIResponseForLog,
-    persona_alignment_check: personaAlignmentCheckForLog === null ? undefined : personaAlignmentCheckForLog
-  });
-
-  if (postedTweetUrl) {
-    console.log(`Post Writer Agent: Post published successfully. URL: ${postedTweetUrl}`);
-  } else {
-    console.log('Post Writer Agent: Post published but URL not retrieved, or posting failed.');
-  }
+  // If loop finishes without returning, generation failed
+  console.error(`Post Writer Agent: Failed to generate new post data for topic "${finalGeneratedTopicForLog || currentTopic}" after multiple attempts.`);
+  return {
+    success: false,
+    postText: null,
+    topic: finalGeneratedTopicForLog || currentTopic, // Still provide topic if known
+    rawOpenAIResponse: rawOpenAIResponseForLog, // Log what we got from the last attempt
+    personaAlignmentCheck: personaAlignmentCheckForLog,
+    errorMessage: 'Failed to generate post content after multiple attempts.'
+  };
 }
 
-// Call the function when this file is executed directly
-if (require.main === module) {
-  mainPostWriter();
-}
-
-// Export the main function as default export
-export default mainPostWriter;
+export {
+  preparePostData,
+  publishTwitterPost,
+  appendPostToLog, // Exporting for the scheduler to use
+  type PostLogEntry, // Exporting the type for the scheduler
+  type PreparedPostData // Exporting the type for clarity if used by scheduler
+};
