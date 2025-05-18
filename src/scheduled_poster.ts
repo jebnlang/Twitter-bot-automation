@@ -221,9 +221,40 @@ async function main() {
             .eq('id', savedPost.id);
           console.log(`Scheduled Poster: Successfully published post ID ${savedPost.id} immediately after preparation. ${postUrl === "POSTED_SUCCESSFULLY" ? "URL retrieval skipped." : `URL: ${postUrl}`}`);
           
-          // Now prepare the next post that will be scheduled normally
-          console.log(`Scheduled Poster: Starting preparation of the next post after immediate publishing...`);
-          main(); // Recursive call to generate the next scheduled post
+          // Instead of recursive call which might not complete, directly prepare the next post here
+          console.log(`Scheduled Poster: Preparing the next scheduled post after immediate publishing...`);
+          
+          // Prepare next post
+          const nextPreparedData = await preparePostData();
+          
+          // Calculate next scheduled time (6 hours from now)
+          const nextScheduledTimeUTC = new Date(Date.now() + (HOURS_BETWEEN_POSTS * 60 * 60 * 1000) + getRandomVariationMs());
+          
+          // Create entry for next post
+          const nextPostEntry: Partial<PostLogEntry> = {
+            topic: nextPreparedData.topic || undefined,
+            posted_text: nextPreparedData.postText || undefined,
+            raw_openai_response: nextPreparedData.rawOpenAIResponse || undefined,
+            persona_alignment_check: nextPreparedData.personaAlignmentCheck || undefined,
+            scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
+            status: 'ready_to_post' as const
+          };
+          
+          // Log the search topic
+          if (nextPreparedData.searchTopic) {
+            console.log(`Scheduled Poster: Used search topic: "${nextPreparedData.searchTopic}" to generate next scheduled content about "${nextPreparedData.topic}"`);
+          }
+          
+          if (nextPreparedData.success && nextPreparedData.postText) {
+            await appendPostToLog(nextPostEntry);
+            console.log(`Scheduled Poster: Successfully prepared and scheduled next post for ${nextScheduledTimeUTC.toISOString()}.`);
+            console.log(`Scheduled Poster: Next post topic: "${nextPreparedData.topic}"`);
+            console.log(`Scheduled Poster: Run completed with current post published and next post scheduled.`);
+          } else {
+            console.error(`Scheduled Poster: Failed to prepare next post after immediate publishing. Will try again on next run.`);
+          }
+          
+          // Exit without recursively calling main()
           return;
         } else {
           await supabase
