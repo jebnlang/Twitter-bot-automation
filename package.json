@@ -12,7 +12,10 @@
     "postinstall": "npx playwright install --with-deps chromium",
     "start": "ts-node src/post_writer.ts",
     "scheduled-poster": "ts-node src/scheduled_poster.ts",
-    "migrate-csv": "ts-node src/migrate_csv_to_supabase.ts"
+    "migrate-csv": "ts-node src/migrate_csv_to_supabase.ts",
+    "start:finder": "ts-node src/finder.ts",
+    "start:brain": "ts-node src/brain.ts",
+    "start:poster": "ts-node src/poster.ts"
   },
   "keywords": [],
   "author": "",
