@@ -36,10 +36,11 @@ async function main() {
   console.log('\n--- Scheduled Poster: Starting Run ---');
 
   // 1. Check for an existing post that is ready and scheduled to be posted
+  const initialStatusFilter: PostLogEntry['status'] = 'ready_to_post';
   const { data: readyPosts, error: fetchError } = await supabase
     .from('posts')
     .select('*') // Select all columns for the ready post
-    .eq('status', 'ready_to_post' as const)
+    .eq('status', initialStatusFilter)
     .order('scheduled_time_utc', { ascending: true })
     .limit(1);
 
@@ -102,10 +103,11 @@ async function main() {
 
   // 2. If no post was found ready, or if a post was just published, prepare the next one.
   // We check if a 'ready_to_post' already exists to avoid creating duplicates if the previous section exited early.
+  const statusToFilter: PostLogEntry['status'] = 'ready_to_post';
   const { data: existingReadyCheck, error: existingReadyError } = await supabase
     .from('posts')
     .select('id')
-    .eq('status', 'ready_to_post' as const)
+    .eq('status', statusToFilter)
     .limit(1);
 
   if (existingReadyError) {
@@ -114,7 +116,7 @@ async function main() {
   }
 
   if (existingReadyCheck && existingReadyCheck.length > 0 && !postPublishedInThisRun) {
-    console.log('Scheduled Poster: A post is already marked 'ready_to_post' and was not published in this run. Skipping new preparation.');
+    console.log("Scheduled Poster: A post is already marked 'ready_to_post' and was not published in this run. Skipping new preparation.");
   } else {
     console.log('Scheduled Poster: Preparing data for the next post...');
     const preparedData = await preparePostData();
