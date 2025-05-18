@@ -176,8 +176,12 @@ async function main() {
       raw_openai_response: preparedData.rawOpenAIResponse || undefined,
       persona_alignment_check: preparedData.personaAlignmentCheck || undefined,
       scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
-      search_topic: preparedData.searchTopic || undefined,
     };
+
+    // Add logging for the search topic
+    if (preparedData.searchTopic) {
+      console.log(`Scheduled Poster: Used search topic: "${preparedData.searchTopic}" to generate content about "${preparedData.topic}"`);
+    }
 
     if (preparedData.success && preparedData.postText) {
       // First determine if we should immediately publish this post

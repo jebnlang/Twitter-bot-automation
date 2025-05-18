@@ -150,10 +150,9 @@ interface PostLogEntry {
   timestamp: string; // Will be handled by Supabase default NOW()
   posted_text: string; // Renamed from postedText for Supabase column convention
   post_url?: string;    // Renamed from postUrl
-  topic?: string;
-  search_topic?: string; // Add this to store which predefined topic was used for the search
-  status: 'pending' | 'posted' | 'failed' | 'generation_failed' | 'ready_to_post'; // Added status & new 'ready_to_post'
-  error_message?: string; // Added error message
+  topic?: string;      // This will store both the generated topic and search topic
+  status: 'pending' | 'posted' | 'failed' | 'generation_failed' | 'ready_to_post';
+  error_message?: string;
   raw_openai_response?: object; // For JSONB
   persona_alignment_check?: string;
   scheduled_time_utc?: string; // For TIMESTAMPTZ
