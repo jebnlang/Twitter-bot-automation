@@ -15,8 +15,7 @@
     "migrate-csv": "ts-node src/migrate_csv_to_supabase.ts",
     "start:finder": "ts-node src/finder.ts",
     "start:brain": "ts-node src/brain.ts",
-    "start:poster": "ts-node src/poster.ts",
-    "check-next-post": "ts-node src/check_next_post.ts"
+    "start:poster": "ts-node src/poster.ts"
   },
   "keywords": [],
   "author": "",

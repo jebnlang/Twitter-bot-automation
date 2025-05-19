@@ -51,7 +51,10 @@ function isTimeToPost(scheduledTime: Date): boolean {
   // Calculate grace period end (scheduledTime plus grace period)
   const gracePeriodEnd = new Date(scheduledTime.getTime() + (SCHEDULE_GRACE_PERIOD_HOURS * 60 * 60 * 1000));
   
-  // Check if current time is between buffer window start and grace period end
+  // Check if scheduled time is in the past and outside grace period
+  const isPastDue = scheduledTime < now && now > gracePeriodEnd;
+  
+  // Normal window check
   const isWithinPostingWindow = now >= bufferWindowStart && now <= gracePeriodEnd;
   
   // Log detailed time information for debugging
@@ -60,18 +63,21 @@ function isTimeToPost(scheduledTime: Date): boolean {
   console.log(`  Scheduled time (UTC): ${scheduledTime.toISOString()}`);
   console.log(`  Buffer window starts: ${bufferWindowStart.toISOString()} (${SCHEDULE_BUFFER_MINUTES} mins before)`);
   console.log(`  Grace period ends: ${gracePeriodEnd.toISOString()} (${SCHEDULE_GRACE_PERIOD_HOURS} hours after)`);
+  console.log(`  Is past due: ${isPastDue}`);
   console.log(`  Is within posting window: ${isWithinPostingWindow}`);
+  console.log(`  Should post: ${isWithinPostingWindow || isPastDue}`);
   
-  return isWithinPostingWindow;
+  // Return true if either within window OR past due
+  return isWithinPostingWindow || isPastDue;
 }
 
 // --- Helper: Reset orphaned posts ---
 async function resetOrphanedPosts(): Promise<void> {
   try {
-    // Find posts that are in 'ready_to_post' status but their scheduled time is too far in the past
-    // These are considered "orphaned" - they missed their window
+    // Find posts that are in 'ready_to_post' status but their scheduled time is VERY far in the past
+    // Only consider posts truly "orphaned" if they're more than 24 hours past their scheduled time
     const cutoffTime = new Date();
-    cutoffTime.setHours(cutoffTime.getHours() - (SCHEDULE_GRACE_PERIOD_HOURS + 1)); // Beyond grace period
+    cutoffTime.setHours(cutoffTime.getHours() - 24); // 24 hours ago instead of just beyond grace period
     
     const { data: orphanedPosts, error } = await supabase
       .from('posts')
@@ -86,7 +92,7 @@ async function resetOrphanedPosts(): Promise<void> {
     }
     
     if (orphanedPosts && orphanedPosts.length > 0) {
-      console.log(`Scheduled Poster: Found ${orphanedPosts.length} orphaned post(s) that missed their posting window:`);
+      console.log(`Scheduled Poster: Found ${orphanedPosts.length} orphaned post(s) that missed their posting window by more than 24 hours:`);
       
       for (const post of orphanedPosts) {
         console.log(`  Post ID ${post.id}: "${post.topic}" scheduled for ${post.scheduled_time_utc}`);
@@ -95,7 +101,7 @@ async function resetOrphanedPosts(): Promise<void> {
           .from('posts')
           .update({
             status: 'missed_schedule',
-            error_message: `Post missed its scheduled time. Was due at ${post.scheduled_time_utc}, detected at ${new Date().toISOString()}.`
+            error_message: `Post missed its scheduled time by more than 24 hours. Was due at ${post.scheduled_time_utc}, detected at ${new Date().toISOString()}.`
           })
           .eq('id', post.id);
         

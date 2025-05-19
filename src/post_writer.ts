@@ -732,7 +732,7 @@ async function preparePostData(): Promise<PreparedPostData> {
   return {
     success: false,
     postText: null,
-    topic: finalGeneratedTopicForLog || currentTopic,
+      topic: finalGeneratedTopicForLog || currentTopic,
     searchTopic: originalSearchTopic || null,
     rawOpenAIResponse: rawOpenAIResponseForLog,
     personaAlignmentCheck: personaAlignmentCheckForLog,
