@@ -15,6 +15,7 @@ dotenvConfig();
 const HOURS_BETWEEN_POSTS = 6;
 const MAX_TIME_VARIATION_MS = 30 * 60 * 1000; // 30 minutes in milliseconds
 const MIN_TIME_BEFORE_FIRST_POST_MS = 0; // Was 5 * 60 * 1000 (5 minutes), now immediate
+const GRACEFUL_EXIT_DELAY_MS = 2000; // 2 seconds delay before exiting
 
 // --- Supabase Client ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -38,177 +39,36 @@ function getRandomVariationMs(): number {
 // --- Main Orchestration Logic ---
 async function main() {
   console.log('\n--- Scheduled Poster: Starting Run ---');
-
-  // 1. Check for an existing post that is ready and scheduled to be posted
-  const initialStatusFilter: PostLogEntry['status'] = 'ready_to_post';
-  const { data: readyPosts, error: fetchError } = await supabase
-    .from('posts')
-    .select('*') // Select all columns for the ready post
-    .eq('status', initialStatusFilter)
-    .order('scheduled_time_utc', { ascending: true })
-    .limit(1);
-
-  if (fetchError) {
-    console.error('Scheduled Poster: Error fetching ready posts:', fetchError);
-    // Decide if to proceed or exit. For now, let's try to prepare a new one if fetching failed.
-  }
-
   let postPublishedInThisRun = false;
   let lastPostTimestampForScheduling: Date | null = null;
+  let processedPostIdInThisRun: number | string | undefined = undefined; // Renamed for clarity
 
-  if (readyPosts && readyPosts.length > 0) {
-    const postToPublish = readyPosts[0] as PostLogEntry;
-    const scheduledTime = new Date(postToPublish.scheduled_time_utc!);
-    const now = new Date();
+  try {
+    // 1. Check for and process any due scheduled post
+    const { data: readyPosts, error: fetchError } = await supabase
+      .from('posts')
+      .select('*')
+      .eq('status', 'ready_to_post') // Using plain string
+      .order('scheduled_time_utc', { ascending: true })
+      .limit(1);
 
-    console.log(`Scheduled Poster: Found a post "${postToPublish.topic || 'Untitled'}" ready, scheduled for ${scheduledTime.toISOString()}`);
-
-    if (scheduledTime <= now) {
-      console.log(`Scheduled Poster: Scheduled time is now or past. Attempting to publish post ID ${postToPublish.id} (Topic: ${postToPublish.topic}).`);
-      
-      const postUrl = await publishTwitterPost(postToPublish.posted_text!);
-      const currentTimeUTC = new Date().toISOString();
-
-      // Consider both actual URLs and the POSTED_SUCCESSFULLY marker as success
-      if (postUrl) {
-        await supabase
-          .from('posts')
-          .update({
-            status: 'posted' as const,
-            post_url: postUrl === "POSTED_SUCCESSFULLY" ? "https://x.com/posted-successfully" : postUrl, // Use a standard URL for the placeholder
-            posted_at_utc: currentTimeUTC,
-            error_message: null 
-          })
-          .eq('id', postToPublish.id!);
-        console.log(`Scheduled Poster: Successfully published post ID ${postToPublish.id}. ${postUrl === "POSTED_SUCCESSFULLY" ? "URL retrieval skipped." : `URL: ${postUrl}`}`);
-        postPublishedInThisRun = true;
-        lastPostTimestampForScheduling = new Date(currentTimeUTC);
-      } else {
-        await supabase
-          .from('posts')
-          .update({
-            status: 'failed_to_post' as const,
-            error_message: 'Publishing failed or URL not retrieved.',
-            posted_at_utc: currentTimeUTC, // Log attempt time
-          })
-          .eq('id', postToPublish.id!);
-        console.error(`Scheduled Poster: Failed to publish post ID ${postToPublish.id}.`);
-        // Even if publishing failed, we might want to schedule a new one based on the *intended* schedule of this failed one.
-        // Or, more simply, use the last *successful* post as the basis.
-        // For now, if a publish fails, we'll rely on the next section to schedule a new one based on the last SUCCESSFUL post.
-      }
-    } else {
-      console.log(`Scheduled Poster: Post ID ${postToPublish.id} is scheduled for ${scheduledTime.toISOString()}. Waiting.`);
-      // If the next post is scheduled for the future, we don't need to prepare another one yet.
-      // The current design implies one 'ready_to_post' at a time.
-      console.log('--- Scheduled Poster: Run Completed (Waiting for scheduled post) ---');
-      return; // Exit early
-    }
-  } else {
-    console.log('Scheduled Poster: No ready posts found. Will prepare a new one.');
-  }
-
-  // 2. If no post was found ready, or if a post was just published, prepare the next one.
-  // We check if a 'ready_to_post' already exists to avoid creating duplicates if the previous section exited early.
-  const statusToFilter: PostLogEntry['status'] = 'ready_to_post';
-  const { data: existingReadyCheck, error: existingReadyError } = await supabase
-    .from('posts')
-    .select('id')
-    .eq('status', statusToFilter)
-    .limit(1);
-
-  if (existingReadyError) {
-    console.error('Scheduled Poster: Error checking for existing ready posts before preparation:', existingReadyError);
-    // Potentially exit or handle, for now, proceed with caution
-  }
-
-  if (existingReadyCheck && existingReadyCheck.length > 0 && !postPublishedInThisRun) {
-    console.log("Scheduled Poster: A post is already marked 'ready_to_post' and was not published in this run. Skipping new preparation.");
-  } else {
-    console.log('Scheduled Poster: Preparing data for the next post...');
-    const preparedData = await preparePostData();
-    
-    // Determine the schedule for this new post
-    if (!lastPostTimestampForScheduling) { // If no post was published in this run, get the last successful post time
-        const { data: lastSuccess, error: lastSuccessError } = await supabase
-            .from('posts')
-            .select('posted_at_utc')
-            .eq('status', 'posted' as const)
-            .order('posted_at_utc', { ascending: false })
-            .limit(1);
-        if (lastSuccessError) {
-            console.error('Scheduled Poster: Error fetching last successful post time:', lastSuccessError);
-        }
-        if (lastSuccess && lastSuccess.length > 0 && lastSuccess[0].posted_at_utc) {
-            lastPostTimestampForScheduling = new Date(lastSuccess[0].posted_at_utc);
-        }
+    if (fetchError) {
+      console.error('Scheduled Poster: Error fetching ready posts:', fetchError);
     }
 
-    let nextScheduledTimeUTC: Date;
-    let postImmediately = false;
-    
-    if (lastPostTimestampForScheduling) {
-        // Normal scheduling based on last post time
-        nextScheduledTimeUTC = new Date(lastPostTimestampForScheduling.getTime() + (HOURS_BETWEEN_POSTS * 60 * 60 * 1000) + getRandomVariationMs());
-    } else {
-        // This is a first post situation (no previous posts found)
-        
-        // Check if we should post immediately after deployment
-        // This happens if we have no posts yet and MIN_TIME_BEFORE_FIRST_POST_MS is 0
-        if (MIN_TIME_BEFORE_FIRST_POST_MS === 0) {
-            console.log('Scheduled Poster: First post after deployment - scheduling for immediate posting');
-            nextScheduledTimeUTC = new Date(); // Schedule for now
-            postImmediately = true;
-        } else {
-            // Use the small delay as configured
-            nextScheduledTimeUTC = new Date(Date.now() + MIN_TIME_BEFORE_FIRST_POST_MS + getRandomVariationMs());
-        }
-    }
-    
-    // Ensure next post is not scheduled in the past if calculations are off or server time is weird
-    if (!postImmediately && nextScheduledTimeUTC.getTime() < Date.now()) {
-        console.warn('Scheduled Poster: Calculated next schedule time is in the past. Adjusting to be in the near future.');
-        nextScheduledTimeUTC = new Date(Date.now() + Math.abs(getRandomVariationMs())); // Small random delay
-    }
+    if (readyPosts && readyPosts.length > 0) {
+      const postToPublish = readyPosts[0] as PostLogEntry;
+      processedPostIdInThisRun = postToPublish.id;
+      const scheduledTime = new Date(postToPublish.scheduled_time_utc!);
+      const now = new Date();
 
-    const newPostEntry: Partial<PostLogEntry> = {
-      topic: preparedData.topic || undefined,
-      posted_text: preparedData.postText || undefined,
-      raw_openai_response: preparedData.rawOpenAIResponse || undefined,
-      persona_alignment_check: preparedData.personaAlignmentCheck || undefined,
-      scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
-    };
+      console.log(`Scheduled Poster: Found a post "${postToPublish.topic || 'Untitled'}" (ID: ${postToPublish.id}) ready, scheduled for ${scheduledTime.toISOString()}`);
 
-    // Add logging for the search topic
-    if (preparedData.searchTopic) {
-      console.log(`Scheduled Poster: Used search topic: "${preparedData.searchTopic}" to generate content about "${preparedData.topic}"`);
-    }
-
-    if (preparedData.success && preparedData.postText) {
-      // First determine if we should immediately publish this post
-      if (postImmediately) {
-        console.log(`Scheduled Poster: Post deployment immediate publishing mode activated`);
-        
-        // First save with "ready_to_post" status, but we'll immediately publish it
-        newPostEntry.status = 'ready_to_post' as const;
-        const { data: savedPost, error: saveError } = await supabase
-          .from('posts')
-          .insert([newPostEntry])
-          .select()
-          .single();
-          
-        if (saveError) {
-          console.error('Scheduled Poster: Error saving new post:', saveError);
-          return;
-        }
-        
-        console.log(`Scheduled Poster: New post saved with ID ${savedPost.id}, now publishing immediately`);
-        
-        // Immediately publish it
-        const postUrl = await publishTwitterPost(savedPost.posted_text);
+      if (scheduledTime <= now) {
+        console.log(`Scheduled Poster: Scheduled time is now or past. Attempting to publish post ID ${postToPublish.id}.`);
+        const postUrl = await publishTwitterPost(postToPublish.posted_text!);
         const currentTimeUTC = new Date().toISOString();
-        
-        // Consider both actual URLs and the POSTED_SUCCESSFULLY marker as success
+
         if (postUrl) {
           await supabase
             .from('posts')
@@ -218,79 +78,167 @@ async function main() {
               posted_at_utc: currentTimeUTC,
               error_message: null 
             })
-            .eq('id', savedPost.id);
-          console.log(`Scheduled Poster: Successfully published post ID ${savedPost.id} immediately after preparation. ${postUrl === "POSTED_SUCCESSFULLY" ? "URL retrieval skipped." : `URL: ${postUrl}`}`);
-          
-          // Instead of recursive call which might not complete, directly prepare the next post here
-          console.log(`Scheduled Poster: Preparing the next scheduled post after immediate publishing...`);
-          
-          // Prepare next post
-          const nextPreparedData = await preparePostData();
-          
-          // Calculate next scheduled time (6 hours from now)
-          const nextScheduledTimeUTC = new Date(Date.now() + (HOURS_BETWEEN_POSTS * 60 * 60 * 1000) + getRandomVariationMs());
-          
-          // Create entry for next post
-          const nextPostEntry: Partial<PostLogEntry> = {
-            topic: nextPreparedData.topic || undefined,
-            posted_text: nextPreparedData.postText || undefined,
-            raw_openai_response: nextPreparedData.rawOpenAIResponse || undefined,
-            persona_alignment_check: nextPreparedData.personaAlignmentCheck || undefined,
-            scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
-            status: 'ready_to_post' as const
-          };
-          
-          // Log the search topic
-          if (nextPreparedData.searchTopic) {
-            console.log(`Scheduled Poster: Used search topic: "${nextPreparedData.searchTopic}" to generate next scheduled content about "${nextPreparedData.topic}"`);
-          }
-          
-          if (nextPreparedData.success && nextPreparedData.postText) {
-            await appendPostToLog(nextPostEntry);
-            console.log(`Scheduled Poster: Successfully prepared and scheduled next post for ${nextScheduledTimeUTC.toISOString()}.`);
-            console.log(`Scheduled Poster: Next post topic: "${nextPreparedData.topic}"`);
-            console.log(`Scheduled Poster: Run completed with current post published and next post scheduled.`);
-          } else {
-            console.error(`Scheduled Poster: Failed to prepare next post after immediate publishing. Will try again on next run.`);
-          }
-          
-          // Exit without recursively calling main()
-          return;
+            .eq('id', postToPublish.id!); 
+          console.log(`Scheduled Poster: Successfully published post ID ${postToPublish.id}. ${postUrl === "POSTED_SUCCESSFULLY" ? "URL retrieval skipped." : `URL: ${postUrl}`}`);
+          postPublishedInThisRun = true;
+          lastPostTimestampForScheduling = new Date(currentTimeUTC);
         } else {
           await supabase
             .from('posts')
             .update({
               status: 'failed_to_post' as const,
-              error_message: 'Immediate publishing failed or URL not retrieved.',
-              posted_at_utc: currentTimeUTC,
+              error_message: 'Publishing failed or URL not retrieved.',
+              posted_at_utc: currentTimeUTC, 
             })
-            .eq('id', savedPost.id);
-          console.error(`Scheduled Poster: Failed to publish post ID ${savedPost.id} immediately.`);
+            .eq('id', postToPublish.id!); 
+          console.error(`Scheduled Poster: Failed to publish post ID ${postToPublish.id}.`);
         }
       } else {
-        // Normal scheduling
-        newPostEntry.status = 'ready_to_post' as const;
-        await appendPostToLog(newPostEntry);
-        console.log(`Scheduled Poster: Successfully prepared and scheduled next post. Topic: "${preparedData.topic}", Scheduled for: ${nextScheduledTimeUTC.toISOString()}`);
+        console.log(`Scheduled Poster: Post ID ${postToPublish.id} is scheduled for ${scheduledTime.toISOString()}. Waiting.`);
+        console.log('--- Scheduled Poster: Run Completed (Waiting for scheduled post) ---');
+        await new Promise(resolve => setTimeout(resolve, GRACEFUL_EXIT_DELAY_MS));
+        process.exit(0);
       }
     } else {
-      newPostEntry.status = 'generation_failed' as const;
-      newPostEntry.error_message = preparedData.errorMessage || 'Unknown error during content generation.';
-      await appendPostToLog(newPostEntry);
-      console.error(`Scheduled Poster: Failed to prepare content for the next post. Error: ${newPostEntry.error_message}`);
+      console.log('Scheduled Poster: No posts currently marked 'ready_to_post' and due now.');
     }
+
+    // 2. Prepare the next post if needed
+    console.log('Scheduled Poster: Checking if a new post needs to be prepared...');
+    const { data: anyReadyPosts, error: anyReadyError } = await supabase
+      .from('posts')
+      .select('id')
+      .eq('status', 'ready_to_post') // Using plain string
+      .limit(1);
+
+    if (anyReadyError) {
+      console.error('Scheduled Poster: Error checking for any existing ready posts:', anyReadyError);
+    }
+
+    let shouldPrepareNextPost = false;
+    if (postPublishedInThisRun) {
+      console.log('Scheduled Poster: A post was published in this run, preparing the next one.');
+      shouldPrepareNextPost = true;
+    } else if (!anyReadyPosts || anyReadyPosts.length === 0) {
+      console.log('Scheduled Poster: No posts are currently 'ready_to_post'. Preparing a new one.');
+      shouldPrepareNextPost = true;
+    } else {
+      console.log('Scheduled Poster: A post is already 'ready_to_post' for the future. No new preparation needed now.');
+    }
+
+    if (shouldPrepareNextPost) {
+      console.log('Scheduled Poster: Initiating preparation of the next post...');
+      try {
+        if (!lastPostTimestampForScheduling) {
+            const { data: lastSuccess, error: lastSuccessError } = await supabase
+                .from('posts')
+                .select('posted_at_utc')
+                .eq('status', 'posted') // Using plain string for .eq()
+                .order('posted_at_utc', { ascending: false })
+                .limit(1);
+            if (lastSuccessError) {
+                console.error('Scheduled Poster: Error fetching last successful post time for scheduling next:', lastSuccessError);
+            }
+            if (lastSuccess && lastSuccess.length > 0 && lastSuccess[0].posted_at_utc) {
+                lastPostTimestampForScheduling = new Date(lastSuccess[0].posted_at_utc);
+                console.log(`Scheduled Poster: Last successful post was at ${lastPostTimestampForScheduling.toISOString()}`);
+            }
+        }
+
+        let nextScheduledTimeUTC: Date;
+        let isImmediateFirstPost = false; 
+
+        if (lastPostTimestampForScheduling) {
+            nextScheduledTimeUTC = new Date(lastPostTimestampForScheduling.getTime() + (HOURS_BETWEEN_POSTS * 60 * 60 * 1000) + getRandomVariationMs());
+        } else {
+            if (MIN_TIME_BEFORE_FIRST_POST_MS === 0 && !processedPostIdInThisRun) { 
+                console.log('Scheduled Poster: First post run - scheduling for immediate posting.');
+                nextScheduledTimeUTC = new Date(); 
+                isImmediateFirstPost = true;
+            } else {
+                nextScheduledTimeUTC = new Date(Date.now() + MIN_TIME_BEFORE_FIRST_POST_MS + getRandomVariationMs());
+            }
+        }
+        
+        if (!isImmediateFirstPost && nextScheduledTimeUTC.getTime() < Date.now()) {
+            console.warn('Scheduled Poster: Calculated next schedule time is in the past. Adjusting to a small delay from now.');
+            nextScheduledTimeUTC = new Date(Date.now() + (1 * 60 * 1000) + Math.abs(getRandomVariationMs()));
+        }
+
+        console.log('Scheduled Poster: Calling preparePostData() for the next post...');
+        const preparedData = await preparePostData();
+
+        const newPostEntry: Partial<PostLogEntry> = {
+          topic: preparedData.topic || undefined,
+          posted_text: preparedData.postText || undefined,
+          raw_openai_response: preparedData.rawOpenAIResponse || undefined,
+          persona_alignment_check: preparedData.personaAlignmentCheck || undefined,
+          scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
+        };
+        
+        if (preparedData.searchTopic) {
+          console.log(`Scheduled Poster: Search topic used: "${preparedData.searchTopic}" to generate content about "${preparedData.topic || '[No Topic Yet]'}"`);
+        }
+
+        if (preparedData.success && preparedData.postText) {
+          if (isImmediateFirstPost) {
+            console.log(`Scheduled Poster: Immediate publishing mode for first ever post.`);
+            newPostEntry.status = 'ready_to_post' as const; // Keep 'as const' for assignment
+            console.log('Scheduled Poster: About to save immediate post as ready_to_post...');
+            const { data: savedPost, error: saveError } = await supabase
+              .from('posts').insert([newPostEntry]).select().single();
+            
+            if (saveError) {
+              console.error('Scheduled Poster: Error saving immediate post before publishing:', saveError);
+              throw saveError;
+            }
+            console.log(`Scheduled Poster: Immediate post saved (ID: ${savedPost.id}). Now publishing...`);
+            
+            const postUrl = await publishTwitterPost(savedPost.posted_text);
+            const currentTimeUTC = new Date().toISOString();
+            
+            if (postUrl) {
+              await supabase.from('posts').update({
+                  status: 'posted' as const,
+                  post_url: postUrl === "POSTED_SUCCESSFULLY" ? "https://x.com/posted-successfully" : postUrl,
+                  posted_at_utc: currentTimeUTC, error_message: null 
+              }).eq('id', savedPost.id);
+              console.log(`Scheduled Poster: Successfully published immediate post (ID: ${savedPost.id}). ${postUrl === "POSTED_SUCCESSFULLY" ? "URL skip." : `URL: ${postUrl}`}`);
+            } else {
+              await supabase.from('posts').update({
+                  status: 'failed_to_post' as const,
+                  error_message: 'Immediate publishing failed.', posted_at_utc: currentTimeUTC
+              }).eq('id', savedPost.id);
+              console.error(`Scheduled Poster: Failed to publish immediate post (ID: ${savedPost.id}).`);
+            }
+          } else {
+            newPostEntry.status = 'ready_to_post' as const; // Keep 'as const' for assignment
+            console.log('Scheduled Poster: About to save next scheduled post as ready_to_post...');
+            await appendPostToLog(newPostEntry);
+            console.log(`Scheduled Poster: Successfully prepared and scheduled next post for ${nextScheduledTimeUTC.toISOString()}. Topic: "${preparedData.topic || '[No Topic Yet]'}".`);
+          }
+        } else {
+          newPostEntry.status = 'generation_failed' as const;
+          newPostEntry.error_message = preparedData.errorMessage || 'Unknown error during content generation.';
+          console.log('Scheduled Poster: About to save post as generation_failed...');
+          await appendPostToLog(newPostEntry);
+          console.error(`Scheduled Poster: Failed to prepare content for the next post. Error: ${newPostEntry.error_message}`);
+        }
+      } catch (preparationError) {
+        console.error('Scheduled Poster: CRITICAL ERROR during next post preparation phase:', preparationError);
+      }
+    }
+
+  } catch (error) {
+    console.error('Scheduled Poster: UNHANDLED CRITICAL ERROR in main execution block:', error);
+  } finally {
+    console.log('--- Scheduled Poster: Run Completed ---');
+    // Only exit if not waiting for a future scheduled post.
+    // If the logic reached a point where it decided to wait, it would have exited earlier.
+    await new Promise(resolve => setTimeout(resolve, GRACEFUL_EXIT_DELAY_MS));
+    process.exit(0);
   }
-  console.log('--- Scheduled Poster: Run Completed ---');
 }
 
 // --- Run Main Function ---
-main()
-  .then(() => {
-    // Optional: Add a small delay if needed for any async operations to settle, though await should handle most.
-    // console.log('Scheduled Poster: Process completed successfully in .then()');
-    process.exit(0);
-  })
-  .catch((error) => {
-    console.error('Scheduled Poster: Unhandled error in main execution:', error);
-    process.exit(1);
-  }); 
+main(); 
