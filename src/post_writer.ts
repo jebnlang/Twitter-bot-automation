@@ -780,10 +780,96 @@ async function preparePostData(): Promise<PreparedPostData> {
   };
 }
 
+// --- NEW: Function to Verify Twitter Authentication ---
+async function verifyTwitterAuthentication(): Promise<boolean> {
+  console.log('Post Writer Agent: Verifying Twitter authentication status...');
+  // Ensure auth.json is hydrated if AUTH_JSON_BASE64 is set (this logic is at the top of the file)
+  // It will exit if critical auth info is missing.
+
+  const browser = await chromium.launch({
+    headless: HEADLESS_MODE,
+    args: [
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--window-size=1280,960'
+    ],
+    timeout: 90000 // 90 second timeout for browser launch
+  });
+
+  const context = await browser.newContext({
+    storageState: PLAYWRIGHT_STORAGE,
+    viewport: { width: 1280, height: 960 },
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+  });
+
+  const page = await context.newPage();
+  let loginSuccess = false;
+  const twitterHomeUrl = 'https://twitter.com/home';
+
+  try {
+    console.log(`Post Writer Agent (Auth Check): Navigating to ${twitterHomeUrl}...`);
+    await page.goto(twitterHomeUrl, { waitUntil: 'load', timeout: 60000 });
+    console.log('Post Writer Agent (Auth Check): Page loaded, waiting 5s for stabilization...');
+    await page.waitForTimeout(5000);
+
+    // Always take a screenshot of the homepage
+    console.log('Post Writer Agent (Auth Check): Taking homepage screenshot...');
+    try {
+      const screenshotBuffer = await page.screenshot();
+      console.log('Post Writer Agent (Auth Check): Homepage screenshot (base64):');
+      console.log(`data:image/png;base64,${screenshotBuffer.toString('base64')}`);
+    } catch (screenshotError: any) {
+      console.error('Post Writer Agent (Auth Check): Could not capture homepage screenshot:', screenshotError.message);
+    }
+
+    const homeTimelineSelector = 'div[aria-label="Home timeline"], div[data-testid="primaryColumn"]';
+    const loggedInElement = page.locator(homeTimelineSelector).first();
+
+    console.log(`Post Writer Agent (Auth Check): Checking for logged-in element: ${homeTimelineSelector}`);
+    try {
+      await loggedInElement.waitFor({ state: 'visible', timeout: 15000 }); // Increased timeout slightly
+      loginSuccess = true;
+      console.log('Post Writer Agent (Auth Check): SUCCESS - Logged-in element found. Authentication appears to be working.');
+      // Optional: Could save a success screenshot here if needed for positive confirmation, but less critical.
+    } catch (e) {
+      loginSuccess = false;
+      console.error('Post Writer Agent (Auth Check): FAILURE - Logged-in element NOT found. Authentication likely failed.');
+      // Screenshot is already taken and logged if this was the first attempt, 
+      // or if an error occurred during navigation that prevented reaching this specific check.
+      // If we want a specific screenshot *at this failure point*, we could add one here, 
+      // but the earlier homepage screenshot should already show the state (e.g., login page).
+    }
+  } catch (error: any) {
+    console.error('Post Writer Agent (Auth Check): Error during authentication check:', error.message);
+    loginSuccess = false; // Ensure failure on any exception during navigation/check
+    // Screenshot is already taken and logged if an error occurred during page.goto or initial stabilization.
+    // If not, or if we want a screenshot specifically at this catch block:
+    if (!page.isClosed()) { // Check if page is still available
+        try {
+            const screenshotBuffer = await page.screenshot();
+            console.error('Post Writer Agent (Auth Check): Error condition screenshot (base64):');
+            console.error(`data:image/png;base64,${screenshotBuffer.toString('base64')}`);
+        } catch (screenshotError: any) {
+            console.error('Post Writer Agent (Auth Check): Could not capture error screenshot during exception:', screenshotError.message);
+        }
+    }
+  } finally {
+    console.log('Post Writer Agent (Auth Check): Closing browser.');
+    if (browser && browser.isConnected()) {
+        await browser.close();
+    }
+  }
+  return loginSuccess;
+}
+
 export {
   preparePostData,
   publishTwitterPost,
-  appendPostToLog, // Exporting for the scheduler to use
-  type PostLogEntry, // Exporting the type for the scheduler
-  type PreparedPostData // Exporting the type for clarity if used by scheduler
+  appendPostToLog,
+  verifyTwitterAuthentication, // Export the new function
+  type PostLogEntry,
+  type PreparedPostData
 };
