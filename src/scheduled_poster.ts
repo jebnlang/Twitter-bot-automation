@@ -4,6 +4,7 @@ import {
   preparePostData,
   publishTwitterPost,
   appendPostToLog,
+  verifyTwitterAuthentication,
   type PostLogEntry,
   type PreparedPostData
 } from './post_writer'; // Assuming post_writer.ts is in the same directory
@@ -161,6 +162,19 @@ async function findReadyPost(): Promise<PostLogEntry | null> {
 async function main() {
   console.log('\n--- Scheduled Poster: Starting Run ---');
   console.log(`Scheduled Poster: Current time (UTC): ${new Date().toISOString()}`);
+
+  // --- START: New Authentication Check ---
+  console.log('Scheduled Poster: Performing pre-run authentication check...');
+  const isAuthenticated = await verifyTwitterAuthentication();
+
+  if (!isAuthenticated) {
+    console.error('Scheduled Poster: CRITICAL - Twitter authentication check failed. Halting current run to prevent further errors.');
+    // Optionally, you could add a notification here (e.g., update a status in Supabase)
+    // For now, we'll just exit. The detailed logs from verifyTwitterAuthentication should be in the output.
+    process.exit(1); // Exit with an error code
+  }
+  console.log('Scheduled Poster: Authentication check successful. Proceeding with normal operations.');
+  // --- END: New Authentication Check ---
 
   // First check for any orphaned posts and mark them appropriately
   await resetOrphanedPosts();
