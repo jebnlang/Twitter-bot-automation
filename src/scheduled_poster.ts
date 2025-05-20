@@ -97,11 +97,13 @@ async function resetOrphanedPosts(): Promise<void> {
       for (const post of orphanedPosts) {
         console.log(`  Post ID ${post.id}: "${post.topic}" scheduled for ${post.scheduled_time_utc}`);
         
+        const errorMsg = `Post missed its scheduled time by more than 24 hours. Was due at ${post.scheduled_time_utc}, detected at ${new Date().toISOString()}.`;
+        
         await supabase
           .from('posts')
           .update({
             status: 'missed_schedule',
-            error_message: `Post missed its scheduled time by more than 24 hours. Was due at ${post.scheduled_time_utc}, detected at ${new Date().toISOString()}.`
+            error_message: errorMsg
           })
           .eq('id', post.id);
         
