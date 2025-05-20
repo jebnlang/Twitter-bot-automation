@@ -503,6 +503,39 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
   let maxRetries = 2; // Add retries for the entire posting process
   let retryCount = 0;
 
+  // Verify login status first before attempting to post
+  try {
+    console.log('Post Writer Agent: Verifying Twitter login status first...');
+    await page.goto('https://twitter.com/home', { waitUntil: 'load', timeout: 60000 });
+    await page.waitForTimeout(5000); // Give the page time to load
+    
+    // Check if we're properly logged in
+    const isLoggedIn = await page.locator('div[aria-label="Home timeline"], div[data-testid="primaryColumn"]').count()
+      .then(() => true)
+      .catch(() => false);
+    
+    if (!isLoggedIn) {
+      console.error('Post Writer Agent: ERROR - Not properly logged in to Twitter. Authentication has expired or is invalid.');
+      await page.screenshot({ path: 'error-auth-expired.png' });
+      console.error('Post Writer Agent: Screenshot saved to error-auth-expired.png');
+      console.error('Post Writer Agent: Please run the regenerate_auth.js script to refresh authentication.');
+      await browser.close();
+      return null;
+    }
+    
+    console.log('Post Writer Agent: Login verification successful, proceeding to post.');
+  } catch (loginCheckError) {
+    console.error('Post Writer Agent: Error while verifying login status:', loginCheckError);
+    try {
+      await page.screenshot({ path: 'error-login-check.png' });
+      console.error('Post Writer Agent: Screenshot saved to error-login-check.png');
+    } catch (screenshotError) {
+      console.error('Post Writer Agent: Failed to save error screenshot:', screenshotError);
+    }
+    await browser.close();
+    return null;
+  }
+
   // Main posting loop with retries
   while (retryCount <= maxRetries) {
     try {
@@ -531,7 +564,12 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
         'div.public-DraftEditor-content[role="textbox"]',
         'div[data-testid="tweetTextarea_0"]',
         'div[contenteditable="true"][aria-multiline="true"]',
-        'div[data-testid="tweetTextInput_0"]'
+        'div[data-testid="tweetTextInput_0"]',
+        'div[data-testid="tweetTextInput"]',
+        'div[contenteditable="true"][role="textbox"]',
+        'div[aria-label="Tweet text"]',
+        'div[aria-labelledby="post-text-area-label"]',
+        'div.notranslate[contenteditable="true"]'
       ];
       
       console.log('Post Writer Agent: Trying multiple selectors for tweet editor...');
@@ -566,7 +604,11 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
       const postButtonSelectors = [
         'button[data-testid="tweetButton"]',
         'div[data-testid="tweetButtonInline"]',
-        'div[role="button"][data-testid="tweetButtonInline"]'
+        'div[role="button"][data-testid="tweetButtonInline"]',
+        'button[data-testid="postButton"]',
+        'button:has-text("Post")',
+        'div[role="button"]:has-text("Post")',
+        'div[data-testid="tweetButtonInline"][role="button"]'
       ];
       
       console.log('Post Writer Agent: Looking for Post button...');
