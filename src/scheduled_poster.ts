@@ -334,11 +334,13 @@ async function main() {
         raw_openai_response: preparedData.rawOpenAIResponse || undefined,
         persona_alignment_check: preparedData.personaAlignmentCheck || undefined,
         scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
+        article_url: preparedData.articleUrl || undefined,
+        article_id: preparedData.articleId,
       };
 
-      // Log the search topic that was used
-      if (preparedData.searchTopic) {
-        console.log(`Scheduled Poster: Used search topic: "${preparedData.searchTopic}" to generate content about "${preparedData.topic}"`);
+      // Log the article that was used
+      if (preparedData.articleUrl) {
+        console.log(`Scheduled Poster: Used article: "${preparedData.articleUrl}" to generate content about "${preparedData.topic}"`);
       }
 
       if (preparedData.success && preparedData.postText) {
@@ -400,12 +402,14 @@ async function main() {
                   raw_openai_response: nextPreparedData.rawOpenAIResponse || undefined,
                   persona_alignment_check: nextPreparedData.personaAlignmentCheck || undefined,
                   scheduled_time_utc: nextScheduledTimeUTC.toISOString(),
-                  status: 'ready_to_post' as const
+                  status: 'ready_to_post' as const,
+                  article_url: nextPreparedData.articleUrl || undefined,
+                  article_id: nextPreparedData.articleId
                 };
                 
-                // Log the search topic
-                if (nextPreparedData.searchTopic) {
-                  console.log(`Scheduled Poster: Used search topic: "${nextPreparedData.searchTopic}" to generate next scheduled content about "${nextPreparedData.topic}"`);
+                // Log the article
+                if (nextPreparedData.articleUrl) {
+                  console.log(`Scheduled Poster: Used article: "${nextPreparedData.articleUrl}" to generate next scheduled content about "${nextPreparedData.topic}"`);
                 }
                 
                 if (nextPreparedData.success && nextPreparedData.postText) {

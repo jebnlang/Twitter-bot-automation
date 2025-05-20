@@ -16,9 +16,8 @@ chromium.use(stealth());
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PLAYWRIGHT_STORAGE = process.env.PLAYWRIGHT_STORAGE || 'auth.json';
 const AUTH_JSON_BASE64 = process.env.AUTH_JSON_BASE64; // Added for Railway deployment
-const POST_WRITER_PERSONA_FILENAME = process.env.BRAIN_PERSONA_FILENAME || 'persona_2.md';
+const POST_WRITER_PERSONA_FILENAME = process.env.BRAIN_PERSONA_FILENAME || 'insight_instructor_persona.md'; // Updated to use new persona
 const HEADLESS_MODE = process.env.POST_WRITER_HEADLESS_MODE !== 'false'; // Default to true (headless)
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -64,11 +63,6 @@ if (!PLAYWRIGHT_STORAGE) {
   }
 }
 
-if (!TAVILY_API_KEY) {
-  console.error('Post Writer Agent: Error - TAVILY_API_KEY is not defined in your .env file.');
-  process.exit(1);
-}
-
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('Post Writer Agent: Error - SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not defined. Please set them in your .env file.');
   process.exit(1);
@@ -81,33 +75,6 @@ const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROL
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
-
-// --- Tavily API Client (Direct REST API Calls) ---
-// Simple wrapper functions for Tavily API calls
-const tavilyApi = {
-  async search(query: string, options: any = {}): Promise<any> {
-    if (!TAVILY_API_KEY) {
-      throw new Error('Tavily API Key is required');
-    }
-
-    try {
-      const response = await axios.post('https://api.tavily.com/search', {
-        api_key: TAVILY_API_KEY,
-        query,
-        search_depth: options.search_depth || 'basic',
-        max_results: options.max_results || 5,
-        include_images: options.include_images || false,
-        include_answer: options.include_answer || false,
-        include_raw_content: options.include_raw_content || false,
-      });
-      
-      return response.data;
-    } catch (error: any) {
-      console.error('Tavily API Error:', error.response?.data || error.message);
-      throw error;
-    }
-  }
-};
 
 // --- Helper: Type with Jitter (copied from poster.ts) ---
 async function typeWithJitter(page: Page, selector: string, text: string, jitterMs: number = 25) {
@@ -136,10 +103,27 @@ interface PreparedPostData {
   success: boolean;
   postText: string | null;
   topic: string | null;
-  searchTopic: string | null;
+  articleUrl: string | null; // Changed from searchTopic to articleUrl
   rawOpenAIResponse: object | null;
   personaAlignmentCheck: string | null;
+  articleId?: number; // Added to track which article was processed
   errorMessage?: string;
+}
+
+// --- New Interface for Article Data ---
+interface ArticleData {
+  id: number;
+  article: string; // Column is named "article" not "url"
+  timestamp?: string;
+  posted_text?: string | null;
+  post_url?: string | null;
+  status: 'pending' | 'processed' | 'posted' | 'failed';
+  error_message?: string | null;
+  raw_openai_response?: object | null;
+  persona_alignment_check?: string | null;
+  scheduled_time_utc?: string | null;
+  posted_at_utc?: string | null;
+  generation_log?: object | null;
 }
 
 // --- Supabase Log Handling ---
@@ -156,32 +140,98 @@ interface PostLogEntry {
   scheduled_time_utc?: string; // For TIMESTAMPTZ
   posted_at_utc?: string; // For TIMESTAMPTZ
   generation_log?: object; // For JSONB
+  article_url?: string; // Added to store the article URL
+  article_id?: number; // Added to reference the posts_news table
 }
 
-async function loadPreviousPosts(): Promise<Pick<PostLogEntry, 'posted_text' | 'topic'>[]> {
+// --- New function to fetch pending articles from posts_news table ---
+async function fetchPendingArticle(): Promise<ArticleData | null> {
   try {
+    console.log('Post Writer Agent: Fetching pending article from posts_news table...');
+    
     const { data, error } = await supabase
-      .from('posts')
-      .select('posted_text, topic')
-      .order('posted_at_utc', { ascending: false }) // IMPORTANT: Order by actual post time
-      .limit(10); // Load last 10 posts for context
-
+      .from('posts_news')
+      .select('*')
+      .eq('status', 'pending')
+      .order('timestamp', { ascending: true }) // Use timestamp instead of created_at
+      .limit(1); // Only get the next article to process
+    
     if (error) {
-      console.error('Post Writer Agent: Error loading previous posts from Supabase:', error);
-      return [];
+      console.error('Post Writer Agent: Error fetching pending article:', error);
+      return null;
     }
-    console.log(`Post Writer Agent: Loaded ${data.length} previous posts from Supabase.`);
-    return data.map(p => ({ posted_text: p.posted_text || '', topic: p.topic }));
+    
+    if (!data || data.length === 0) {
+      console.log('Post Writer Agent: No pending articles found.');
+      return null;
+    }
+    
+    console.log(`Post Writer Agent: Found pending article with ID ${data[0].id}: ${data[0].article}`);
+    return data[0] as ArticleData;
   } catch (error) {
-    console.error('Post Writer Agent: Unexpected error loading previous posts from Supabase:', error);
-    return [];
+    console.error('Post Writer Agent: Unexpected error fetching pending article:', error);
+    return null;
   }
 }
 
-// Updated to log more details to Supabase
+// --- New function to update article status ---
+async function updateArticleStatus(articleId: number, status: 'pending' | 'processed' | 'posted' | 'failed', errorMessage?: string): Promise<void> {
+  try {
+    const updateData: any = { 
+      status,
+      // Add appropriate timestamps based on status
+      ...(status === 'processed' ? { processed_at: new Date().toISOString() } : {}),
+      ...(status === 'posted' ? { posted_at_utc: new Date().toISOString() } : {})
+    };
+    
+    if (errorMessage) {
+      updateData.error_message = errorMessage;
+    }
+    
+    const { error } = await supabase
+      .from('posts_news')
+      .update(updateData)
+      .eq('id', articleId);
+    
+    if (error) {
+      console.error(`Post Writer Agent: Error updating article ${articleId} status to ${status}:`, error);
+    } else {
+      console.log(`Post Writer Agent: Successfully updated article ${articleId} status to ${status}`);
+    }
+  } catch (error) {
+    console.error(`Post Writer Agent: Unexpected error updating article ${articleId} status:`, error);
+  }
+}
+
+// --- New function to fetch article content using axios ---
+async function fetchArticleContent(url: string): Promise<string | null> {
+  try {
+    console.log(`Post Writer Agent: Fetching content from article URL: ${url}`);
+    
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+      },
+      timeout: 30000 // 30 second timeout
+    });
+    
+    if (response.status === 200) {
+      // Return the HTML content - we'll process it in the OpenAI prompt
+      return response.data;
+    } else {
+      console.error(`Post Writer Agent: Failed to fetch article content. Status code: ${response.status}`);
+      return null;
+    }
+  } catch (error) {
+    console.error('Post Writer Agent: Error fetching article content:', error);
+    return null;
+  }
+}
+
+// Updated to log more details to Supabase, including article information
 async function appendPostToLog(newPostData: Partial<PostLogEntry>): Promise<void> { // Use Partial as not all fields always present
   try {
-    // Ensure all fields map to new Supabase columns if needed
+    // Ensure all fields map to new Supabase columns
     // created_at is handled by Supabase default NOW()
     // scheduled_time_utc and posted_at_utc will be set explicitly by the scheduler when appropriate
     const { error } = await supabase.from('posts').insert([newPostData]);
@@ -190,187 +240,45 @@ async function appendPostToLog(newPostData: Partial<PostLogEntry>): Promise<void
       console.error('Post Writer Agent: Error appending post to Supabase log:', error);
     } else {
       console.log('Post Writer Agent: Successfully appended new post to Supabase log');
+      
+      // If this post is associated with an article and is posted successfully, update the article status
+      if (newPostData.article_id && newPostData.status === 'posted') {
+        await updateArticleStatus(newPostData.article_id, 'posted');
+        console.log(`Post Writer Agent: Updated article ${newPostData.article_id} status to posted`);
+      }
     }
   } catch (error) {
     console.error('Post Writer Agent: Unexpected error appending post to Supabase log:', error);
   }
 }
 
-// --- Function to get a unique topic and fresh context ---
-async function getUniqueTopicAndFreshContext(
-  previousPosts: Pick<PostLogEntry, 'posted_text' | 'topic'>[]
-): Promise<TopicContextResult> {
-  console.log('Post Writer Agent: Attempting to find a unique topic and fresh context...');
-  // Filter both null and undefined values
-  const recentTopicsToAvoid = previousPosts.map(p => p.topic).slice(-7).filter(t => t !== undefined && t !== null) as string[];
-  console.log('Post Writer Agent: Recent topics to avoid:', recentTopicsToAvoid);
-
-  let attempts = 0;
-  const maxAttempts = 5; // Increased from 3 to 5 for more flexibility with predetermined topics
-
-  while (attempts < maxAttempts) {
-    attempts++;
-    console.log(`Post Writer Agent: Topic finding attempt ${attempts}/${maxAttempts}`);
-    
-    // Instead of hardcoded search queries, get a random topic from the search_topics table
-    let searchTopic: string;
-    try {
-      // Fetch topics from search_topics table in random order
-      // Exclude topics that have been recently used
-      let { data: availableTopics, error } = await supabase
-        .from('search_topics')
-        .select('id, topic')
-        .order('last_used_at', { ascending: true, nullsFirst: true }) // Prefer topics that haven't been used yet or used long ago
-        .limit(10); // Get 10 topics to choose from
-      
-      if (error) {
-        console.error('Post Writer Agent: Error fetching search topics from Supabase:', error);
-        // Fallback to hardcoded topics if there's an error
-        const fallbackTopics = [
-          'latest news and trends in AI prompt engineering',
-          'hot topics in large language models and prompting techniques',
-          'breakthroughs in AI interaction and prompt crafting',
-          'AI coding assistants and developer tools',
-          'no-code platforms for AI application development'
-        ];
-        searchTopic = fallbackTopics[Math.floor(Math.random() * fallbackTopics.length)];
-        console.log(`Post Writer Agent: Using fallback search topic: "${searchTopic}"`);
-      } else if (!availableTopics || availableTopics.length === 0) {
-        console.error('Post Writer Agent: No search topics found in database, using fallback');
-        searchTopic = 'latest news and trends in AI prompt engineering';
-      } else {
-        // Filter out recently used topics
-        const filteredTopics = availableTopics.filter(t => 
-          !recentTopicsToAvoid.some(avoid => 
-            avoid?.toLowerCase().includes(t.topic.toLowerCase()) || 
-            t.topic.toLowerCase().includes(avoid?.toLowerCase())
-          )
-        );
-        
-        if (filteredTopics.length === 0) {
-          // If all topics have been recently used, just pick a random one from the original list
-          console.log('Post Writer Agent: All topics have been recently used, selecting random topic anyway');
-          const randomTopic = availableTopics[Math.floor(Math.random() * availableTopics.length)];
-          searchTopic = randomTopic.topic;
-        } else {
-          // Pick a random topic from the filtered list
-          const randomTopic = filteredTopics[Math.floor(Math.random() * filteredTopics.length)];
-          searchTopic = randomTopic.topic;
-          
-          // Update the last_used_at timestamp for this topic
-          await supabase
-            .from('search_topics')
-            .update({ last_used_at: new Date().toISOString() })
-            .eq('id', randomTopic.id);
-        }
-        console.log(`Post Writer Agent: Selected search topic: "${searchTopic}"`);
-      }
-    } catch (topicError) {
-      console.error('Post Writer Agent: Error selecting search topic:', topicError);
-      searchTopic = 'latest news and trends in AI prompt engineering'; // Fallback
-    }
-    
-    let broadSearchResults;
-    try {
-      console.log(`Post Writer Agent: Performing Tavily search using topic: "${searchTopic}"`);
-      const tavilyResponse = await tavilyApi.search(searchTopic, {
-        search_depth: "basic",
-        max_results: 7,
-      });
-      broadSearchResults = tavilyResponse.results; 
-
-      if (!broadSearchResults || broadSearchResults.length === 0) {
-        console.warn('Post Writer Agent: Tavily search returned no results.');
-        if (attempts === maxAttempts) return { topic: null, searchContext: null };
-        await new Promise(resolve => setTimeout(resolve, 1500)); 
-        continue;
-      }
-    } catch (searchError) {
-      console.error('Post Writer Agent: Error during Tavily search:', searchError);
-      if (attempts === maxAttempts) return { topic: null, searchContext: null };
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      continue;
-    }
-
-    const candidateTopics: string[] = broadSearchResults
-      .map((result: any) => result.title)
-      .filter((title: string | null): title is string => title !== null && title.trim() !== '');
-
-    if (candidateTopics.length === 0) {
-      console.warn('Post Writer Agent: Could not extract any candidate topics from Tavily search results.');
-      if (attempts === maxAttempts) return { topic: null, searchContext: null };
-      continue; 
-    }
-
-    for (const candidateTopic of candidateTopics) {
-      // Add null safety with optional chaining
-      if (!recentTopicsToAvoid.some(avoid => avoid?.toLowerCase() === candidateTopic.toLowerCase())) {
-        console.log(`Post Writer Agent: Found unique candidate topic from search: "${candidateTopic}"`);
-        
-        console.log(`Post Writer Agent: Performing focused Tavily search on topic: "${candidateTopic}"`);
-        try {
-          const focusedTavilyResponse = await tavilyApi.search(candidateTopic, {
-            search_depth: "advanced",
-            max_results: 5,
-            include_answer: false,
-            include_raw_content: false,
-            include_images: false, 
-          });
-          const focusedSearchResults = focusedTavilyResponse.results;
-
-          if (!focusedSearchResults || focusedSearchResults.length === 0) {
-            console.warn(`Post Writer Agent: Tavily focused search for "${candidateTopic}" returned no results.`);
-            continue; 
-          }
-
-          const formattedFocusedSearchContext = focusedSearchResults
-            .map((r: any, i: number) => `Relevant Information Source ${i+1}: "${r.title}"\nURL: ${r.url}\nContent: ${r.content}`)
-            .join('\n\n---\n');
-          
-          console.log(`Post Writer Agent: Successfully gathered focused context for "${candidateTopic}" from Tavily.`);
-          
-          // Important: Return both the refined candidate topic AND the original search topic
-          // This ensures we know which predefined topic from our table generated this content
-          return { 
-            topic: candidateTopic, 
-            searchContext: formattedFocusedSearchContext,
-            originalSearchTopic: searchTopic // Add this as part of the return type
-          };
-
-        } catch (focusedSearchError) {
-          console.error(`Post Writer Agent: Error during Tavily focused search for topic "${candidateTopic}":`, focusedSearchError);
-          continue; 
-        }
-      }
-    }
-    console.warn('Post Writer Agent: All candidate topics from this search were similar to recent posts or focused search failed. Retrying with different search topic if attempts left.');
-  }
-
-  console.warn('Post Writer Agent: Could not find a unique topic and gather focused context after max attempts with Tavily.');
-  return { topic: null, searchContext: null };
-}
-
-// --- Update the TopicContextResult interface to include the original search topic ---
-interface TopicContextResult {
-  topic: string | null;
-  searchContext: string | null;
-  originalSearchTopic?: string; // Add this to store which topic from our table was used
-}
-
 // --- OpenAI Content Generation ---
-async function generateNewPost(persona: string, previousPostTexts: string[], currentTopic: string, searchContext: string): Promise<{ tweet: string | null; generatedTopic: string | null; rawOpenAIResponseForLog: object | null; personaAlignmentCheckForLog: string | null }> {
-  console.log(`Post Writer Agent: Generating new post on topic "${currentTopic}" with OpenAI...`);
+async function generateNewPost(persona: string, articleUrl: string, articleContent: string, articleTitle?: string | null): Promise<{ tweet: string | null; generatedTopic: string | null; rawOpenAIResponseForLog: object | null; personaAlignmentCheckForLog: string | null }> {
+  console.log(`Post Writer Agent: Generating new post for article: "${articleTitle || articleUrl}" with OpenAI...`);
   let promptContent = `Your primary goal is to embody the following Twitter persona. Adhere to it strictly.
 --- PERSONA START ---
 ${persona}
 --- PERSONA END ---
 
-Based on this persona, you need to draft a new, original tweet. The tweet should be insightful, valuable, and sound human—like an experienced builder sharing knowledge, not a marketing department.
+Based on this persona, you need to draft a new, original tweet that summarizes and provides insight on the article I'm sharing. The tweet should be insightful, valuable, and sound human-like.
+
+--- ARTICLE TO SUMMARIZE ---
+URL: ${articleUrl}
+${articleTitle ? `Title: ${articleTitle}` : ''}
+Content: ${articleContent.slice(0, 15000)}... (content may be truncated)
+--- END ARTICLE ---
 
 --- EXAMPLES OF TWEET STYLE ---
 GOOD EXAMPLE (Adheres to Persona):
-Tweet: "After a decade debugging distributed systems, the one constant is change. Embrace observability, not just as a tool, but as a mindset. Know your state."
-Reasoning: This tweet is good because it shares an experienced insight, uses a confident and direct tone, and avoids marketing language, hashtags, and questions.
+"At Computex 2025, Nvidia unveiled a sweeping vision: humanoid robotics powered by custom AI infrastructure, built to reason, adapt, and operate in physical space.
+
+Their GR00T project aims to unify language, perception, and motor control through foundation models trained across diverse physical tasks. Combined with Isaac Lab, a GPU-accelerated robotics simulation environment, this enables fast learning in synthetic environments before real-world deployment.
+
+Alongside robotics, Nvidia revealed next-gen server and networking hardware optimized for AI agent workflows. Think low-latency, high-bandwidth systems engineered for multi-agent inference and decision-making at scale.
+
+This is not just about faster GPUs. Its about building AI-native infrastructure where reasoning meets robotics, and autonomy meets embodiment.
+
+The future Nvidia is shaping blends silicon, simulation, and cognition into one stack. Prompting wont stay on screens. It will walk, move, and act in the world."
 
 BAD EXAMPLE (Violates Persona):
 Tweet: "🚀 Excited to announce our new AI-powered widget! It will revolutionize your workflow! #AI #Innovation. Thoughts?"
@@ -382,37 +290,23 @@ Key rules to follow for THIS TWEET:
 2.  DO NOT use hashtags.
 3.  DO NOT use em dashes (—).
 4.  AVOID marketing hype, overly enthusiastic language, or corporate-sounding phrases. Focus on authenticity and genuine insight.
-5.  Ensure the tweet is fresh and unique, and not too similar in topic or phrasing to the previously posted tweets listed below.
-6.  DO NOT mention Teleprompt or its features in this tweet. The product description in the persona is only context, not content.
-7.  Maximize readability with short, punchy sentences and **ensure you use double line breaks (\n\n) between paragraphs or distinct ideas to create visual spacing, similar to the provided example image.**
-8.  **AIM FOR A LENGTH OF AROUND 600 CHARACTERS (approximately 3-5 substantial paragraphs) to provide in-depth, insightful, and educational content.**
-9.  **The primary topic for this tweet should be: "${currentTopic}".** Draw inspiration and information from the 'RECENT WEB SEARCH CONTEXT' provided below.
+5.  DO NOT mention Teleprompt or its features in this tweet. The product description in the persona is only context, not content.
+6.  Maximize readability with short, punchy sentences and **ensure you use double line breaks (\n\n) between paragraphs or distinct ideas to create visual spacing, similar to the provided example image.**
+7.  **AIM FOR A LENGTH OF AROUND 800 CHARACTERS (approximately 3-5 substantial paragraphs) to provide in-depth, insightful, and educational content.**
+8.  **For this tweet, extract the most valuable insights from the article and present them in a clear, educational manner.**
 `;
-
-  promptContent += '\n--- RECENT WEB SEARCH CONTEXT (for relevance and inspiration) ---\n';
-  promptContent += searchContext;
-  promptContent += '\n--- END RECENT WEB SEARCH CONTEXT ---\n';
-
-
-  if (previousPostTexts.length > 0) {
-    promptContent += '\n--- PREVIOUSLY POSTED TWEETS (for ensuring originality) ---';
-    previousPostTexts.slice(-5).forEach((text, index) => {
-      promptContent += `\nPrevious Post ${index + 1}: ${text}`;
-    });
-    promptContent += '\n--- END PREVIOUSLY POSTED TWEETS ---';
-  }
 
   promptContent += `
 --- INSTRUCTIONS FOR YOUR RESPONSE ---
-Before you provide the final tweet, first write a short (1-2 sentence) 'Persona Alignment Check:' where you briefly explain how your planned tweet aligns with the core persona attributes and the given topic.
+Before you provide the final tweet, first write a short (1-2 sentence) 'Persona Alignment Check:' where you briefly explain how your planned tweet aligns with the core persona attributes and effectively summarizes the article.
 
-Next, on a new line, clearly starting with 'Generated Topic:', provide the main topic of the tweet you are about to write. This should closely match or be a refinement of the provided topic: "${currentTopic}".
+Next, on a new line, clearly starting with 'Generated Topic:', provide a concise topic that represents the main focus of your tweet based on the article.
 
 Then, on a new line, clearly starting with 'Tweet:', provide ONLY the tweet text.
 
 Example of response format:
-Persona Alignment Check: This tweet reflects an experienced builder sharing a direct observation on [topic], avoids hype and questions.
-Generated Topic: [Main topic of the tweet]
+Persona Alignment Check: This tweet distills the article's key insights on [topic] while maintaining an educational and informative tone without marketing language.
+Generated Topic: [Main topic extracted from the article]
 Tweet: [Your carefully crafted tweet text here]
 --- END INSTRUCTIONS FOR YOUR RESPONSE ---
 
@@ -423,10 +317,10 @@ Now, draft the new tweet based on all the above instructions.
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: "You are an AI assistant strictly following a detailed persona and set of rules to draft a unique, insightful, and well-structured Twitter post of approximately 600 characters on a given topic, using provided web search context. Your main job is to adhere to all constraints, especially regarding tone, style, length, paragraph structure (double line breaks), providing a persona alignment check, explicitly stating the generated topic, and avoiding questions." },
+        { role: 'system', content: "You are an AI assistant strictly following a detailed persona and set of rules to draft a unique, insightful, and well-structured Twitter post of approximately 800 characters, summarizing an article. Your main job is to adhere to all constraints, especially regarding tone, style, length, paragraph structure (double line breaks), providing a persona alignment check, explicitly stating the generated topic, and avoiding questions." },
         { role: 'user', content: promptContent },
       ],
-      max_tokens: 450, // Adjusted for topic, context, alignment check + ~600 char tweet
+      max_tokens: 450, // Adjusted for topic, context, alignment check + ~800 char tweet
       temperature: 0.7,
       n: 1,
     });
@@ -470,6 +364,191 @@ Now, draft the new tweet based on all the above instructions.
     console.error('Post Writer Agent: Error calling OpenAI API:', error);
     return { tweet: null, generatedTopic: null, rawOpenAIResponseForLog: null, personaAlignmentCheckForLog: null };
   }
+}
+
+// --- NEW Main Data Preparation Function ---
+async function preparePostData(): Promise<PreparedPostData> {
+  console.log('--- Post Writer Agent: Starting Data Preparation ---');
+
+  await loadPostWriterPersona();
+
+  // Fetch a pending article instead of topics
+  const pendingArticle = await fetchPendingArticle();
+  
+  if (!pendingArticle) {
+    console.error('Post Writer Agent: No pending articles found in posts_news table.');
+    return {
+      success: false,
+      postText: null,
+      topic: null,
+      articleUrl: null,
+      rawOpenAIResponse: null,
+      personaAlignmentCheck: null,
+      errorMessage: 'No pending articles found in posts_news table.'
+    };
+  }
+
+  // Fetch the article content
+  const articleContent = await fetchArticleContent(pendingArticle.article);
+  
+  if (!articleContent) {
+    console.error(`Post Writer Agent: Failed to fetch content for article: ${pendingArticle.article}`);
+    // Update article status to failed
+    await updateArticleStatus(pendingArticle.id, 'failed', 'Failed to fetch article content');
+    return {
+      success: false,
+      postText: null,
+      topic: null,
+      articleUrl: pendingArticle.article,
+      articleId: pendingArticle.id,
+      rawOpenAIResponse: null,
+      personaAlignmentCheck: null,
+      errorMessage: 'Failed to fetch article content'
+    };
+  }
+
+  // Mark the article as being processed
+  await updateArticleStatus(pendingArticle.id, 'processed');
+
+  // Generate post based on article content
+  let newPostText: string | null = null;
+  let finalGeneratedTopicForLog: string | null = null;
+  let rawOpenAIResponseForLog: object | null = null;
+  let personaAlignmentCheckForLog: string | null = null;
+  const maxRetries = 3; // Retries for OpenAI generation
+
+  for (let i = 0; i < maxRetries; i++) {
+    console.log(`Post Writer Agent: Attempt ${i + 1} to generate new post data for article: "${pendingArticle.article}"`);
+    const generationResult = await generateNewPost(
+      postWriterPersonaContent, 
+      pendingArticle.article, 
+      articleContent,
+      null // We don't have a title field in the posts_news table
+    );
+    
+    newPostText = generationResult.tweet;
+    finalGeneratedTopicForLog = generationResult.generatedTopic;
+    rawOpenAIResponseForLog = generationResult.rawOpenAIResponseForLog;
+    personaAlignmentCheckForLog = generationResult.personaAlignmentCheckForLog;
+
+    if (newPostText) {
+      console.log(`Post Writer Agent: Successfully generated post content for article "${pendingArticle.article}"`);
+      return {
+        success: true,
+        postText: newPostText,
+        topic: finalGeneratedTopicForLog,
+        articleUrl: pendingArticle.article,
+        articleId: pendingArticle.id,
+        rawOpenAIResponse: rawOpenAIResponseForLog,
+        personaAlignmentCheck: personaAlignmentCheckForLog,
+      };
+    }
+    
+    if (i < maxRetries - 1) {
+      console.log('Post Writer Agent: Failed to generate suitable post data, retrying after a short delay...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+
+  // If loop finishes without returning, generation failed
+  console.error(`Post Writer Agent: Failed to generate new post data for article "${pendingArticle.article}" after multiple attempts.`);
+  // Update article status to failed
+  await updateArticleStatus(pendingArticle.id, 'failed', 'Failed to generate post content after multiple attempts');
+  return {
+    success: false,
+    postText: null,
+    topic: finalGeneratedTopicForLog,
+    articleUrl: pendingArticle.article,
+    articleId: pendingArticle.id,
+    rawOpenAIResponse: rawOpenAIResponseForLog,
+    personaAlignmentCheck: personaAlignmentCheckForLog,
+    errorMessage: 'Failed to generate post content after multiple attempts.'
+  };
+}
+
+// --- Function to Verify Twitter Authentication ---
+async function verifyTwitterAuthentication(): Promise<boolean> {
+  console.log('Post Writer Agent: Verifying Twitter authentication status...');
+  // Ensure auth.json is hydrated if AUTH_JSON_BASE64 is set (this logic is at the top of the file)
+  // It will exit if critical auth info is missing.
+
+  const browser = await chromium.launch({
+    headless: HEADLESS_MODE,
+    args: [
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--window-size=1280,960'
+    ],
+    timeout: 90000 // 90 second timeout for browser launch
+  });
+
+  const context = await browser.newContext({
+    storageState: PLAYWRIGHT_STORAGE,
+    viewport: { width: 1280, height: 960 },
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+  });
+
+  const page = await context.newPage();
+  let loginSuccess = false;
+  const twitterHomeUrl = 'https://twitter.com/home';
+
+  try {
+    console.log(`Post Writer Agent (Auth Check): Navigating to ${twitterHomeUrl}...`);
+    await page.goto(twitterHomeUrl, { waitUntil: 'load', timeout: 60000 });
+    console.log('Post Writer Agent (Auth Check): Page loaded, waiting 5s for stabilization...');
+    await page.waitForTimeout(5000);
+
+    // Always take a screenshot of the homepage
+    console.log('Post Writer Agent (Auth Check): Taking homepage screenshot...');
+    try {
+      const screenshotBuffer = await page.screenshot();
+      console.log('Post Writer Agent (Auth Check): Homepage screenshot (base64):');
+      console.log(`data:image/png;base64,${screenshotBuffer.toString('base64')}`);
+    } catch (screenshotError: any) {
+      console.error('Post Writer Agent (Auth Check): Could not capture homepage screenshot:', screenshotError.message);
+    }
+
+    const homeTimelineSelector = 'div[aria-label="Home timeline"], div[data-testid="primaryColumn"]';
+    const loggedInElement = page.locator(homeTimelineSelector).first();
+
+    console.log(`Post Writer Agent (Auth Check): Checking for logged-in element: ${homeTimelineSelector}`);
+    try {
+      await loggedInElement.waitFor({ state: 'visible', timeout: 15000 }); // Increased timeout slightly
+      loginSuccess = true;
+      console.log('Post Writer Agent (Auth Check): SUCCESS - Logged-in element found. Authentication appears to be working.');
+      // Optional: Could save a success screenshot here if needed for positive confirmation, but less critical.
+    } catch (e) {
+      loginSuccess = false;
+      console.error('Post Writer Agent (Auth Check): FAILURE - Logged-in element NOT found. Authentication likely failed.');
+      // Screenshot is already taken and logged if this was the first attempt, 
+      // or if an error occurred during navigation that prevented reaching this specific check.
+      // If we want a specific screenshot *at this failure point*, we could add one here, 
+      // but the earlier homepage screenshot should already show the state (e.g., login page).
+    }
+  } catch (error: any) {
+    console.error('Post Writer Agent (Auth Check): Error during authentication check:', error.message);
+    loginSuccess = false; // Ensure failure on any exception during navigation/check
+    // Screenshot is already taken and logged if an error occurred during page.goto or initial stabilization.
+    // If not, or if we want a screenshot specifically at this catch block:
+    if (!page.isClosed()) { // Check if page is still available
+        try {
+            const screenshotBuffer = await page.screenshot();
+            console.error('Post Writer Agent (Auth Check): Error condition screenshot (base64):');
+            console.error(`data:image/png;base64,${screenshotBuffer.toString('base64')}`);
+        } catch (screenshotError: any) {
+            console.error('Post Writer Agent (Auth Check): Could not capture error screenshot during exception:', screenshotError.message);
+        }
+    }
+  } finally {
+    console.log('Post Writer Agent (Auth Check): Closing browser.');
+    if (browser && browser.isConnected()) {
+        await browser.close();
+    }
+  }
+  return loginSuccess;
 }
 
 // --- Playwright Posting Logic ---
@@ -708,168 +787,11 @@ async function publishTwitterPost(postText: string): Promise<string | null> {
   return postUrl; // This will be null if URL couldn't be confirmed or posting failed
 }
 
-// --- NEW Main Data Preparation Function ---
-async function preparePostData(): Promise<PreparedPostData> {
-  console.log('--- Post Writer Agent: Starting Data Preparation ---');
-
-  await loadPostWriterPersona();
-
-  const previousPostsFromDb = await loadPreviousPosts();
-  const previousPostContext = previousPostsFromDb.map(p => ({ posted_text: p.posted_text, topic: p.topic }));
-
-  const topicResult = await getUniqueTopicAndFreshContext(previousPostContext);
-  const { topic: currentTopic, searchContext, originalSearchTopic } = topicResult;
-
-  if (!currentTopic || !searchContext) {
-    console.error('Post Writer Agent: Could not determine a unique topic or fetch search context during data preparation.');
-    return {
-      success: false,
-      postText: null,
-      topic: null,
-      searchTopic: null,
-      rawOpenAIResponse: null,
-      personaAlignmentCheck: null,
-      errorMessage: 'Could not determine a unique topic or fetch search context.'
-    };
-  }
-
-  let newPostText: string | null = null;
-  let finalGeneratedTopicForLog: string | null = null;
-  let rawOpenAIResponseForLog: object | null = null;
-  let personaAlignmentCheckForLog: string | null = null;
-  const maxRetries = 3; // Retries for OpenAI generation
-
-  for (let i = 0; i < maxRetries; i++) {
-    console.log(`Post Writer Agent: Attempt ${i + 1} to generate new post data on topic: "${currentTopic}".`);
-    const previousPostTextsOnly = previousPostContext.map(p => p.posted_text || '');
-    const generationResult = await generateNewPost(postWriterPersonaContent, previousPostTextsOnly, currentTopic, searchContext);
-    
-    newPostText = generationResult.tweet;
-    finalGeneratedTopicForLog = generationResult.generatedTopic || currentTopic;
-    rawOpenAIResponseForLog = generationResult.rawOpenAIResponseForLog;
-    personaAlignmentCheckForLog = generationResult.personaAlignmentCheckForLog;
-
-    if (newPostText) {
-      console.log(`Post Writer Agent: Successfully generated post content for topic "${finalGeneratedTopicForLog}"`);
-      console.log(`Post Writer Agent: Original search topic: "${originalSearchTopic}"`);
-      return {
-        success: true,
-        postText: newPostText,
-        topic: finalGeneratedTopicForLog,
-        searchTopic: originalSearchTopic || null,
-        rawOpenAIResponse: rawOpenAIResponseForLog,
-        personaAlignmentCheck: personaAlignmentCheckForLog,
-      };
-    }
-    if (i < maxRetries - 1) {
-      console.log('Post Writer Agent: Failed to generate suitable post data, retrying after a short delay...');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-
-  // If loop finishes without returning, generation failed
-  console.error(`Post Writer Agent: Failed to generate new post data for topic "${finalGeneratedTopicForLog || currentTopic}" after multiple attempts.`);
-  return {
-    success: false,
-    postText: null,
-      topic: finalGeneratedTopicForLog || currentTopic,
-    searchTopic: originalSearchTopic || null,
-    rawOpenAIResponse: rawOpenAIResponseForLog,
-    personaAlignmentCheck: personaAlignmentCheckForLog,
-    errorMessage: 'Failed to generate post content after multiple attempts.'
-  };
-}
-
-// --- NEW: Function to Verify Twitter Authentication ---
-async function verifyTwitterAuthentication(): Promise<boolean> {
-  console.log('Post Writer Agent: Verifying Twitter authentication status...');
-  // Ensure auth.json is hydrated if AUTH_JSON_BASE64 is set (this logic is at the top of the file)
-  // It will exit if critical auth info is missing.
-
-  const browser = await chromium.launch({
-    headless: HEADLESS_MODE,
-    args: [
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--window-size=1280,960'
-    ],
-    timeout: 90000 // 90 second timeout for browser launch
-  });
-
-  const context = await browser.newContext({
-    storageState: PLAYWRIGHT_STORAGE,
-    viewport: { width: 1280, height: 960 },
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-  });
-
-  const page = await context.newPage();
-  let loginSuccess = false;
-  const twitterHomeUrl = 'https://twitter.com/home';
-
-  try {
-    console.log(`Post Writer Agent (Auth Check): Navigating to ${twitterHomeUrl}...`);
-    await page.goto(twitterHomeUrl, { waitUntil: 'load', timeout: 60000 });
-    console.log('Post Writer Agent (Auth Check): Page loaded, waiting 5s for stabilization...');
-    await page.waitForTimeout(5000);
-
-    // Always take a screenshot of the homepage
-    console.log('Post Writer Agent (Auth Check): Taking homepage screenshot...');
-    try {
-      const screenshotBuffer = await page.screenshot();
-      console.log('Post Writer Agent (Auth Check): Homepage screenshot (base64):');
-      console.log(`data:image/png;base64,${screenshotBuffer.toString('base64')}`);
-    } catch (screenshotError: any) {
-      console.error('Post Writer Agent (Auth Check): Could not capture homepage screenshot:', screenshotError.message);
-    }
-
-    const homeTimelineSelector = 'div[aria-label="Home timeline"], div[data-testid="primaryColumn"]';
-    const loggedInElement = page.locator(homeTimelineSelector).first();
-
-    console.log(`Post Writer Agent (Auth Check): Checking for logged-in element: ${homeTimelineSelector}`);
-    try {
-      await loggedInElement.waitFor({ state: 'visible', timeout: 15000 }); // Increased timeout slightly
-      loginSuccess = true;
-      console.log('Post Writer Agent (Auth Check): SUCCESS - Logged-in element found. Authentication appears to be working.');
-      // Optional: Could save a success screenshot here if needed for positive confirmation, but less critical.
-    } catch (e) {
-      loginSuccess = false;
-      console.error('Post Writer Agent (Auth Check): FAILURE - Logged-in element NOT found. Authentication likely failed.');
-      // Screenshot is already taken and logged if this was the first attempt, 
-      // or if an error occurred during navigation that prevented reaching this specific check.
-      // If we want a specific screenshot *at this failure point*, we could add one here, 
-      // but the earlier homepage screenshot should already show the state (e.g., login page).
-    }
-  } catch (error: any) {
-    console.error('Post Writer Agent (Auth Check): Error during authentication check:', error.message);
-    loginSuccess = false; // Ensure failure on any exception during navigation/check
-    // Screenshot is already taken and logged if an error occurred during page.goto or initial stabilization.
-    // If not, or if we want a screenshot specifically at this catch block:
-    if (!page.isClosed()) { // Check if page is still available
-        try {
-            const screenshotBuffer = await page.screenshot();
-            console.error('Post Writer Agent (Auth Check): Error condition screenshot (base64):');
-            console.error(`data:image/png;base64,${screenshotBuffer.toString('base64')}`);
-        } catch (screenshotError: any) {
-            console.error('Post Writer Agent (Auth Check): Could not capture error screenshot during exception:', screenshotError.message);
-        }
-    }
-  } finally {
-    console.log('Post Writer Agent (Auth Check): Closing browser.');
-    if (browser && browser.isConnected()) {
-        await browser.close();
-    }
-  }
-  return loginSuccess;
-}
-
 export {
   preparePostData,
   publishTwitterPost,
   appendPostToLog,
-  verifyTwitterAuthentication, // Export the new function
+  verifyTwitterAuthentication,
   type PostLogEntry,
   type PreparedPostData
 };
